@@ -110,7 +110,7 @@ You can also hand WarriorGPT work through an [OpenCode](https://opencode.ai/) su
 
 Claude sees the tool description, but works best with a short rule in your `CLAUDE.md`, for example:
 
-> Use `ask_warriorgpt` for small, fully specified code generation (boilerplate, a straightforward function, tests for existing code). Attach inputs with `context_files`; set `output_file` for one new file, or list every file to create or change in `files`; then read and check the result. Keep design, debugging, and subtle logic with Claude.
+> Use `ask_warriorgpt` for small, fully specified code generation (boilerplate, a straightforward function, tests for existing code). Attach inputs with `context_files`; set `output_file` for one new file, or list every file to create or change in `files`; then read and check the result. Split mixed tasks so the mechanical part still goes to WarriorGPT. Keep design, debugging, and subtle logic with Claude.
 
 ### Only in some sessions: a `claude-warriorgpt` alias
 

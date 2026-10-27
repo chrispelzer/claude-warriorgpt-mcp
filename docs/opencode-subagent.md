@@ -186,7 +186,7 @@ Pick one per task:
 
 Add a rule like this to your `CLAUDE.md` (global `~/.claude/CLAUDE.md`, or a project's):
 
-> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` when you can name every file to create or change. Use the `warrior-coder` subagent when the model needs to find files itself or run the code to check it. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. If WarriorGPT gets the same task wrong twice, do it yourself.
+> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` when you can name every file to create or change. Use the `warrior-coder` subagent when the model needs to find files itself or run the code to check it. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. Split mixed tasks so the mechanical part still goes to WarriorGPT. If WarriorGPT gets the same task wrong twice, do it yourself.
 
 ## Try it
 

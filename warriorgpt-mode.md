@@ -19,6 +19,35 @@ verify. WarriorGPT only does work where being a weaker model does not matter.
 In WarriorGPT mode, prefer WarriorGPT over writing the code yourself or
 handing it to a Claude subagent for tasks that pass this test.
 
+## Check WarriorGPT first
+
+Before you write code yourself or hand it to a Claude subagent, check whether
+`ask_warriorgpt` could do it. If it could not, be able to say why in one line
+("touches auth", "cause unknown", "can't name the files"). "It's quicker to do
+it myself" is not a reason: a WarriorGPT call plus a diff review usually costs
+less Claude usage than writing the code.
+
+Good fits that are easy to miss:
+- A new class or function whose signature, behavior, and tests you can state.
+- Tests for code that already exists, following a sibling test file.
+- Deleting leftovers or dead entries from files you have already found.
+- Config, build, and dotfile edits (composer/package scripts, `.gitignore`,
+  CI, deploy scripts) where you can state the exact change.
+- Doc updates where you supply the facts and the model only writes them up.
+- Review findings that name the file, the line, and the fix.
+
+## Split mixed tasks
+
+One sensitive part does not pull a whole task to Claude. When a task mixes
+mechanical work with logic that must stay with Claude, carve the mechanical
+part out (form fields and table columns, boilerplate tests, wiring a class
+into config, docs) and send it to WarriorGPT; keep the sensitive logic
+(authorization rules, query scoping, the tricky algorithm) and the review.
+
+When you write or execute a plan in this mode, size steps so each one names
+its files, and mark which steps go to WarriorGPT. A plan task that bundles a
+whole feature hides the mechanical steps that could have gone.
+
 ## Using `ask_warriorgpt`
 
 Make it the default for tasks that pass the test above where you can name
@@ -33,7 +62,9 @@ Pick `model` per task: `local.qwen3.8-27b` (the default) for writing code,
 as a fallback if those are down.
 
 It cannot see the repo or run anything. If the `warrior-coder` subagent is set
-up (see docs/opencode-subagent.md), use it instead when the task:
+up (see docs/opencode-subagent.md), use it instead only when the task needs
+what `ask_warriorgpt` lacks. It costs far more per task, because OpenCode
+re-sends the whole context on every step. Use it when the task:
 - needs the model to run the code or tests and fix its own mistakes,
 - needs it to read nearby files you cannot name up front, or
 - has edits that are hard to state as exact search/replace text, such as a
@@ -47,6 +78,8 @@ Without `warrior-coder`, do those tasks with Claude.
 - Debugging and anything where the cause is not yet known.
 - Code review and final verification of WarriorGPT's output.
 - Subtle logic: concurrency, security, auth, data migrations, money, dates.
+  This means the logic itself, not every file near it (see "Split mixed
+  tasks").
 - Anything ambiguous, or that needs this conversation's history to make sense.
 - Anything touching production or needing the user's judgement.
 
