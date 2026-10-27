@@ -1,0 +1,21 @@
+{
+  "name": "claude-warriorgpt-mcp",
+  "version": "1.0.0",
+  "description": "MCP server that gives Claude Code an ask_warriorgpt tool backed by Wayne State's WarriorGPT API",
+  "type": "module",
+  "bin": {
+    "warriorgpt-mcp": "warriorgpt-mcp.mjs"
+  },
+  "files": [
+    "warriorgpt-mcp.mjs"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chrispelzer/claude-warriorgpt-mcp.git"
+  },
+  "license": "MIT",
+  "private": true
+}
