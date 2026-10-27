@@ -5,22 +5,15 @@
 import { createInterface } from 'node:readline';
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { dirname, resolve, join } from 'node:path';
-import { homedir } from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
 
-const API_URL = 'https://warriorgpt.wayne.edu/api/v1/chat/completions';
-const DEFAULT_MODEL = process.env.WARRIORGPT_MODEL || 'local.qwen3.8-27b';
+const API_URL = `${API_BASE}/chat/completions`;
 const MODELS = {
     'local.qwen3.8-27b': 'Qwen 3.8 27B, 262k context. Best general coder (default).',
     'local.gpt-oss-120b': 'GPT-OSS 120B, 131k context. Stronger reasoning, slower.',
     'local.laguna-s-2.1': 'Laguna S 2.1, 131k context.',
     'local.gemma-4-31b': 'Gemma 4 31B, 131k context.',
 };
-const KEY_NAME = 'warriorgpt-api-key';
-const STATE_DIR = process.platform === 'win32'
-    ? join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'warriorgpt-mcp')
-    : join(homedir(), '.local/share/warriorgpt-mcp');
-const SESSION = process.env.CLAUDE_CODE_SESSION_ID || 'unknown';
 
 const TOOL = {
     name: 'ask_warriorgpt',
@@ -62,26 +55,6 @@ const TOOL = {
         required: ['prompt'],
     },
 };
-
-// Windows has no built-in CLI that reads a stored credential, so it relies on the env var alone.
-const KEY_STORES = {
-    darwin: { cmd: 'security', args: ['find-generic-password', '-a', process.env.USER, '-s', KEY_NAME, '-w'],
-        hint: `or store ${KEY_NAME} in the keychain` },
-    linux: { cmd: 'secret-tool', args: ['lookup', 'service', KEY_NAME],
-        hint: `or store it with secret-tool under service ${KEY_NAME}` },
-};
-
-function apiKey() {
-    if (process.env.WARRIORGPT_API_KEY) return process.env.WARRIORGPT_API_KEY;
-    // Claude Code launched outside a login shell won't have the export from the shell config.
-    const store = KEY_STORES[process.platform];
-    if (!store) return '';
-    try {
-        return execFileSync(store.cmd, store.args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    } catch {
-        return '';
-    }
-}
 
 const FILES_FORMAT = `Reply with only file blocks and no other text. For each file you create or change:
 
@@ -181,10 +154,7 @@ function writeFiles(text, allowed, stats) {
 
 async function askWarriorGPT(args) {
     const key = apiKey();
-    if (!key) {
-        const hint = KEY_STORES[process.platform]?.hint;
-        throw new Error(`No WarriorGPT API key: set WARRIORGPT_API_KEY${hint ? ` ${hint}` : ''}.`);
-    }
+    if (!key) throw new Error(missingKeyMessage());
 
     if (args.files?.length && args.output_file) throw new Error('Pass files or output_file, not both.');
     const files = (args.files || []).map((p) => resolve(p));
