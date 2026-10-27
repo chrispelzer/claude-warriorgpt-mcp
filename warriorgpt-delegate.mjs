@@ -106,7 +106,8 @@ const instructions = opts.instructions.map((f) => {
     if (!existsSync(f)) fail(2, `instruction file ${f} does not exist`);
     return resolve(f);
 });
-const dir = realpathSync(opts.dir);
+// .native expands Windows 8.3 short names, so dir and gitTop compare as the same path.
+const dir = realpathSync.native(opts.dir);
 
 const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
 const globalCfgPath = join(configHome, 'opencode', 'opencode.json');
@@ -120,7 +121,8 @@ try {
 const providerKey = globalCfg.providers ? 'providers' : 'provider';
 if (!globalCfg[providerKey]?.[provider]) fail(1, `provider ${provider} is not in ${globalCfgPath}`);
 
-const gitTop = git(dir, 'rev-parse', '--show-toplevel');
+const top = git(dir, 'rev-parse', '--show-toplevel');
+const gitTop = top && realpathSync.native(top);
 const slug = basename(gitTop || dir);
 const runDir = join(opts['run-root'] || join(STATE_DIR, 'runs', slug), name);
 mkdirSync(runDir, { recursive: true });
