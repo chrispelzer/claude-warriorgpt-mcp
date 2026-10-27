@@ -63,12 +63,20 @@ as a fallback if those are down.
 
 It cannot see the repo or run anything. If the `warrior-coder` subagent is set
 up (see docs/opencode-subagent.md), use it instead only when the task needs
-what `ask_warriorgpt` lacks. It costs far more per task, because OpenCode
-re-sends the whole context on every step. Use it when the task:
+what `ask_warriorgpt` lacks. It uses more Claude usage per task (a Haiku
+subagent writes the brief and checks the result) and is slower. Use it when
+the task:
 - needs the model to run the code or tests and fix its own mistakes,
 - needs it to read nearby files you cannot name up front, or
 - has edits that are hard to state as exact search/replace text, such as a
   sweep across many places in a large file.
+
+Size `warrior-coder` tasks to the model: `local.qwen3.8-27b` takes bounded
+tasks (some reading and choosing inside named files); `local.gpt-oss-120b`
+only atomic ones (one file, one change, exact text given). Split anything
+bigger. It can also answer a read-only question about one folder in read mode.
+If the worker asks questions, answer them (or ask the user) and have the
+subagent resume the same run rather than starting over.
 
 Without `warrior-coder`, do those tasks with Claude.
 

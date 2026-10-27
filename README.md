@@ -2,7 +2,7 @@
 
 An MCP server that gives [Claude Code](https://code.claude.com/) one tool, `ask_warriorgpt`, which calls Wayne State's [WarriorGPT](https://warriorgpt.wayne.edu/) API directly. Your Claude Code session stays on your Claude plan; only the tool call goes to WarriorGPT, so routine code generation does not count against your Claude usage.
 
-It is a single Node file with no dependencies and works on macOS, Linux, and Windows.
+It is plain Node with no dependencies and works on macOS, Linux, and Windows.
 
 ## Requirements
 
@@ -98,13 +98,13 @@ Pass variables at registration with `claude mcp add ... -e WARRIORGPT_MODEL=loca
 
 ## Usage log
 
-Each call appends `{ts, session, model, in, out}` to `usage.jsonl` in the state directory, where `session` is the Claude Code session id. While a request is running, an `active-<session>` file exists there. A status line script can read both to show WarriorGPT activity and token totals.
+Each call appends `{ts, session, model, in, out}` to `usage.jsonl` in the state directory, where `session` is the Claude Code session id. While a request is running, an `active-<session>` file exists there. Runs through `warriorgpt-delegate` append the same record with `via: "opencode"`. A status line script can read both to show WarriorGPT activity and token totals.
 
 The state directory is `~/.local/share/warriorgpt-mcp` on macOS and Linux, and `%LOCALAPPDATA%\warriorgpt-mcp` on Windows.
 
 ## Compared with OpenCode
 
-You can also hand WarriorGPT work through an [OpenCode](https://opencode.ai/) subagent, which can search the repo and run code to check itself but costs far more per task. Use `ask_warriorgpt` when you can name the files involved. [docs/opencode-subagent.md](docs/opencode-subagent.md) covers setup, trade-offs, and a benchmark of the two.
+You can also hand WarriorGPT work through an [OpenCode](https://opencode.ai/) subagent, which can search the repo and run code to check itself, but uses some Claude usage per task for the Haiku subagent that briefs and checks it, and is slower. Use `ask_warriorgpt` when you can name the files involved. The npm install includes `warriorgpt-delegate`, a runner for that route: it checks the model answers, runs OpenCode in a git worktree with a minimal config, lets the worker stop and ask questions, and writes a report for the subagent to verify. [docs/opencode-subagent.md](docs/opencode-subagent.md) covers setup, trade-offs, and a benchmark of the two.
 
 ## Telling Claude when to use it
 
@@ -159,6 +159,10 @@ If you also set up the [OpenCode subagent](docs/opencode-subagent.md), the same 
 | 429 / `quota_exceeded` | Rate limit or quota. Wait, or let Claude do the task. |
 | `/mcp` shows warriorgpt failed (Windows) | The server was registered without `cmd /c`. Remove it with `claude mcp remove warriorgpt` and redo install step 3. |
 | `/mcp` shows warriorgpt failed | `warriorgpt-mcp` is not on Claude Code's PATH, often after switching Node versions. Reinstall, or register the full path from `which warriorgpt-mcp` (`where warriorgpt-mcp` on Windows). |
+
+## Credits
+
+The `warriorgpt-delegate` runner, its worker rules, and the dispatcher version of `warrior-coder` are adapted from a PowerShell setup by [adammpkins](https://github.com/adammpkins).
 
 ## License
 
