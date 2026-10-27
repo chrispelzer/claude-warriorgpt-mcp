@@ -29,7 +29,8 @@ nothing is written unless every edit applies. Then check the result with
 `git diff`.
 
 Pick `model` per task: `local.qwen3.8-27b` (the default) for writing code,
-`local.gpt-oss-120b` when the task needs more reasoning.
+`local.gpt-oss-120b` when the task needs more reasoning, `local.gemma-4-31b`
+as a fallback if those are down.
 
 It cannot see the repo or run anything. If the `warrior-coder` subagent is set
 up (see docs/opencode-subagent.md), use it instead when the task:

@@ -92,12 +92,19 @@ Add this provider to OpenCode's global config file, `~/.config/opencode/opencode
           "name": "Laguna S 2.1",
           "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
           "limit": { "context": 131072, "output": 32768 }
+        },
+        "local.gemma-4-31b": {
+          "name": "Gemma 4 31B (vision, no tools)",
+          "capabilities": { "tools": false, "input": ["text", "image"], "output": ["text"] },
+          "limit": { "context": 131072, "output": 32768 }
         }
       }
     }
   }
 }
 ```
+
+Gemma has no tool calling, so OpenCode can use it for chat but not to edit files; the subagent below does not use it.
 
 These are OpenCode 2 key names (`providers`, `package`, `settings`). Older OpenCode versions use `provider`, `npm`, and `options` instead.
 
