@@ -4,13 +4,17 @@
   "description": "MCP server that gives Claude Code an ask_warriorgpt tool backed by Wayne State's WarriorGPT API",
   "type": "module",
   "bin": {
-    "warriorgpt-mcp": "warriorgpt-mcp.mjs"
+    "warriorgpt-mcp": "warriorgpt-mcp.mjs",
+    "warriorgpt-delegate": "warriorgpt-delegate.mjs"
   },
   "scripts": {
     "test": "node --test"
   },
   "files": [
     "warriorgpt-mcp.mjs",
+    "warriorgpt-delegate.mjs",
+    "common.mjs",
+    "delegate/",
     "warriorgpt-mode.md"
   ],
   "engines": {

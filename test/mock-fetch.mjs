@@ -3,8 +3,11 @@ import { readFileSync, writeFileSync } from 'node:fs';
 
 globalThis.fetch = async (url, init) => {
     if (process.env.MOCK_REQUEST) writeFileSync(process.env.MOCK_REQUEST, init.body);
+    const status = Number(process.env.MOCK_STATUS || 200);
     return {
-        ok: true,
+        ok: status < 400,
+        status,
+        text: async () => 'mock error',
         json: async () => ({
             usage: { prompt_tokens: 10, completion_tokens: 20 },
             choices: [{
