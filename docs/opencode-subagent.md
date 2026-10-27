@@ -1,8 +1,8 @@
 # Delegating through OpenCode instead
 
-This MCP server is the simplest way to let Claude Code hand work to WarriorGPT, but it is not the only one. This guide shows the other route: a Claude Code subagent that runs [OpenCode](https://opencode.ai/) against WarriorGPT, so the WarriorGPT model can read the repo, edit several files, and run commands itself.
+This MCP server is the simplest way to let Claude Code hand work to WarriorGPT, but it is not the only one. This guide shows the other route: a Claude Code subagent that runs [OpenCode](https://opencode.ai/) against WarriorGPT, so the WarriorGPT model can search the repo, edit files, and run commands itself.
 
-It costs more and is slower than `ask_warriorgpt`; see [Compared with OpenCode](../README.md#compared-with-opencode) for the trade-offs and benchmark. The two work side by side: with both set up, Claude can use `ask_warriorgpt` for single-file work and the subagent for the rest.
+It costs more and is slower than `ask_warriorgpt`; see [Compared with OpenCode](../README.md#compared-with-opencode) for the trade-offs and benchmark. The two work side by side: with both set up, Claude can use `ask_warriorgpt` when it can name the files and the subagent for the rest.
 
 ```
 You
@@ -162,7 +162,7 @@ Pick one per task:
 
 Add a rule like this to your `CLAUDE.md` (global `~/.claude/CLAUDE.md`, or a project's):
 
-> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` for a new file or a rewrite of one short file. Use the `warrior-coder` subagent for edits across several files, tasks where the model should run the code to check it, or small changes to large files. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. If WarriorGPT gets the same task wrong twice, do it yourself.
+> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` when you can name every file to create or change. Use the `warrior-coder` subagent when the model needs to find files itself or run the code to check it. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. If WarriorGPT gets the same task wrong twice, do it yourself.
 
 ## Try it
 
