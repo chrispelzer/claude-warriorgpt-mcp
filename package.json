@@ -6,6 +6,9 @@
   "bin": {
     "warriorgpt-mcp": "warriorgpt-mcp.mjs"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "files": [
     "warriorgpt-mcp.mjs"
   ],
