@@ -7,7 +7,7 @@ It is plain Node with no dependencies and works on macOS, Linux, and Windows.
 ## Requirements
 
 - Claude Code
-- Node 18 or newer
+- Node 22 or newer
 - A WarriorGPT API key from https://warriorgpt.wayne.edu/developer/api-key
 
 ## Install
