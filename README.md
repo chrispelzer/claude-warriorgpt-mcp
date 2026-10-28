@@ -164,6 +164,10 @@ If you also set up the [OpenCode subagent](docs/opencode-subagent.md), the same 
 
 The `warriorgpt-delegate` runner, its worker rules, and the dispatcher version of `warrior-coder` are adapted from a PowerShell setup by [adammpkins](https://github.com/adammpkins).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 [MIT](LICENSE)
