@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsS
 import { dirname, resolve, join, sep } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
 import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS } from './loop.mjs';
-import { makeCopy, inside, TooBigError } from './workspace.mjs';
+import { makeCopy, inside, CantCopyError } from './workspace.mjs';
 import { availableParallelism } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
@@ -696,7 +696,7 @@ export async function runAsk(args) {
         try {
             first = await makeCopy(cwd);
         } catch (err) {
-            if (!(err instanceof TooBigError)) throw err;
+            if (!(err instanceof CantCopyError)) throw err;
             log(`=== parallel attempts off: ${err.message}; one attempt`);
             return null;
         }
