@@ -243,7 +243,14 @@ export async function runLoop(ctx) {
         async run_node({ code }) {
             if (typeof code !== 'string' || !code.trim()) return 'error: code is required';
             probes++;
+            // A snippet may write in the tree: a change to a task file counts as an edit, so a stale check
+            // result is not reused and the rollback sees it.
+            const before = snapshot();
             const ran = await ctx.runNode(code);
+            if (ctx.files.some((f) => !sameBytes(before.get(f), existsSync(f) ? readFileSync(f) : null))) {
+                edits++;
+                ctx.log('--- run_node changed a task file; counted as an edit');
+            }
             const head = ran.timedOut ? 'TIMED OUT' : `exit ${ran.code}`;
             return `${head}\n${tail(ran.output, OUTPUT_CHARS) || '(no output)'}`;
         },
@@ -251,7 +258,7 @@ export async function runLoop(ctx) {
             if (mode === 'verify' && !probes && doneRefusals++ === 0) {
                 return 'not yet: first test the spec rules with run_node.';
             }
-            if (await passingNow()) return { finished: true, summary: String(summary || '') };
+            if (await passingNow()) return { finished: true, summary: String(summary || ''), at: edits };
             return `not done: the check does not pass with your latest edits.\n${tail(lastCheck.output, OUTPUT_CHARS)}`;
         },
     };
@@ -263,7 +270,7 @@ export async function runLoop(ctx) {
                 selfCheck: { finished: true, steps: step - fixEnd.step, edits: edits - fixEnd.edits, summary } };
         }
         if (!ctx.selfCheck) return { passed: true, finished: true, steps: step, summary, edits };
-        fixEnd = { step, edits, summary, snapshot: new Map(ctx.files.map((f) => [f, existsSync(f) ? readFileSync(f) : null])) };
+        fixEnd = { step, edits, summary, snapshot: snapshot() };
         mode = 'verify';
         probes = 0;
         doneRefusals = 0;
@@ -374,6 +381,12 @@ export async function runLoop(ctx) {
             });
             if (group.length > 1) ctx.log(`--- ${group.length} read-only calls ran at once`);
             i = j;
+        }
+        // done was checked against the files before any edit that came after it in the same reply.
+        if (finished && finished.at !== edits) {
+            finished = null;
+            messages.push({ role: 'user', content: 'You changed files after calling done, so done was not accepted. ' +
+                'Run the check, then call done again.' });
         }
         if (finished) {
             const out = finish(step, finished.summary);
