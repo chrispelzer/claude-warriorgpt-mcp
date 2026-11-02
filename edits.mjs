@@ -1,7 +1,7 @@
 // File blocks and search/replace edits: parsing a reply, finding each search text (exactly, then with the
 // forgiving matchers below), and working out every write before any file is touched.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync, statSync, chmodSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
 // Models often wrap a whole file in one fence despite being told not to.
@@ -150,7 +150,11 @@ export function writeText(path, text, crlf) {
     const body = crlf ? text.replace(/\n/g, '\r\n') : text;
     const tmp = `${path}.wgpt-${process.pid}-${Math.random().toString(36).slice(2, 8)}.tmp`;
     try {
-        writeFileSync(tmp, body);
+        // The replacement keeps the old file's mode (an executable script stays executable).
+        let mode;
+        try { mode = statSync(path).mode & 0o7777; } catch { /* a new file */ }
+        writeFileSync(tmp, body, mode === undefined ? undefined : { mode });
+        if (mode !== undefined) chmodSync(tmp, mode); // the umask may have narrowed it
         renameSync(tmp, path);
     } catch {
         rmSync(tmp, { force: true });
