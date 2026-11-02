@@ -57,9 +57,28 @@ file, set `output_file`. To create or change several files, list them all in
 nothing is written unless every edit applies. Then check the result with
 `git diff`.
 
+When the task has tests or a type check you can name, pass it as `check`.
+One first attempt goes out, checked in its own copy of the folder, raced from
+the start by a tool-loop lane in its own copy; the first to pass is applied.
+The lane works with tools (read files in scope, edit them, run the check, run
+JavaScript snippets with Node) until the check passes or `max_steps` runs out,
+and every file is restored if it never does. Add `verify` (`--verify`) when the
+tests are thin and the spec has rules they miss: after the check passes, the
+model runs a short self-check in the tool loop (up to 8 steps) that tests those
+rules with Node asserts and fixes the code when it breaks a stated rule. A
+checked call can take several minutes, and an
+MCP call blocks this session the whole time, so run checked or multi-attempt
+tasks with the `warriorgpt-ask` CLI through Bash with `run_in_background`
+(see the README, "Background runs"), keep working, and review the diff when it
+exits. Exit 0 means the check passed; with `verify`, that holds even when the
+self-check ran out of steps (its edits are undone if they broke the check).
+Exit 4 means the check never passed and every file
+is back as it was: do not retry the same call, hand the task to `warrior-coder`
+(below), which can run the tests and read around the code.
+
 Pick `model` per task: `local.qwen3.8-27b` (the default) for writing code,
 `local.gpt-oss-120b` when the task needs more reasoning, `local.gemma-4-31b`
-as a fallback if those are down.
+if those are down.
 
 It cannot see the repo or run anything. If the `warrior-coder` subagent is set
 up (see docs/opencode-subagent.md), use it instead only when the task needs
