@@ -583,12 +583,14 @@ export async function runAsk(args) {
     const loopNoThinking = () => loopThinking === 'off' || (loopThinking === 'auto' && runawaySeen);
     // state.base: the steps' thinking budget, raised for the loop lane or seeded from the race, back to base once a
     // step makes an edit; cut-offs double it up to the step's output limit less room for the tool call.
-    const loopChatFor = (state, { signal, say = log, base = loopThinkBudget } = {}) => async (msgs, { tools, maxTokens: limit, budgetScale = 1, thinkBudget: fixed = 0 }) => {
+    const loopChatFor = (state, { signal, say = log, base = loopThinkBudget } = {}) => async (msgs, { tools, maxTokens: limit, budgetScale = 1, thinkBudget: fixed = 0, deadline = 0 }) => {
         const room = state.base > base ? Math.max(limit, state.base + 4096) : limit;
         let reply;
         try {
             reply = await chat(key, { model, messages: msgs, maxTokens: room,
-                sampling: samplingFor(model, temperature), tools, noThinking: loopNoThinking(), signal,
+                sampling: samplingFor(model, temperature), tools, noThinking: loopNoThinking(),
+                // deadline (the self-check's time limit) cancels the request in flight, not just the next one.
+                signal: deadline ? AbortSignal.any([AbortSignal.timeout(Math.max(1, deadline - Date.now())), ...(signal ? [signal] : [])]) : signal,
                 thinkBudget: fixed ? Math.min(fixed, room - 1024) : base && Math.min(state.base * budgetScale, Math.max(base, room - 1024)) });
         } catch (err) {
             if (err instanceof CancelledError && err.usage) countReply({ usage: err.usage });
@@ -1043,7 +1045,8 @@ export async function runAsk(args) {
         } else {
             verified = false;
             const why = res.error ? ` (${res.error})` : '';
-            const stillOk = !res.edits || (await runCheck(check, cwd, checkTimeout)).ok;
+            // After an error the edit count is lost (res.edits is 0), so the check runs again then too.
+            const stillOk = (!res.edits && !res.error) || (await runCheck(check, cwd, checkTimeout)).ok;
             if (stillOk) {
                 verifyNote = `verify: incomplete${why}: the self-check ran out of ${res.timedOut ? 'time' : 'steps'}${res.edits ? `; kept its ${nEdits}, since the check still passes` : ''}`;
             } else {
