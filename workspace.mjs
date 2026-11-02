@@ -13,7 +13,9 @@ const LINK = new Set(['node_modules']);
 export const MAX_COPY_FILES = 5000;
 export const MAX_COPY_BYTES = 200 * 1024 * 1024;
 
-export class TooBigError extends Error {}
+// The tree cannot be copied safely: the attempts run one at a time in the tree itself.
+export class CantCopyError extends Error {}
+export class TooBigError extends CantCopyError {}
 
 function sameVolume(a, b) {
     if (process.platform === 'win32') return parse(a).root.toLowerCase() === parse(b).root.toLowerCase();
@@ -40,6 +42,13 @@ async function survey(root) {
             if (LINK.has(e.name) && e.isDirectory()) {
                 links.push(abs);
                 continue;
+            }
+            if (e.isSymbolicLink()) {
+                // A linked folder or a broken link cannot be copied as a file, and linking it would share it.
+                const to = await fsp.stat(abs).catch(() => null);
+                if (!to?.isFile()) {
+                    throw new CantCopyError(`the working tree has a ${to ? 'linked folder' : 'broken link'} (${relative(root, abs)})`);
+                }
             }
             if (e.isDirectory()) await walk(abs);
             else if (e.isFile() || e.isSymbolicLink()) {
