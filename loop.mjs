@@ -215,7 +215,13 @@ export async function runLoop(ctx) {
                 edits++;
                 return `created ${path}`;
             }
-            if (search === '') return 'error: search is empty; copy the text to replace from the file';
+            // An empty search fills an empty file; on a file with text it would be ambiguous.
+            if (search === '' && cur.text.trim()) return 'error: search is empty; copy the text to replace from the file';
+            if (search === '') {
+                writeText(target, replace.endsWith('\n') ? replace : `${replace}\n`, cur.crlf);
+                edits++;
+                return `filled ${path}`;
+            }
             const res = replaceOnce(cur.text, search, replace);
             if (res.error) return `error: ${res.error}. Nothing changed. Read the file again and copy the search text exactly.`;
             writeText(target, res.content, cur.crlf);
