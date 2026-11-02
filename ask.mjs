@@ -181,6 +181,8 @@ async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
         }
     }
     if (!stopped) take(buf.trim());
+    // A stream that closes without a finish reason was cut short: its content is partial, so it is not a reply.
+    if (!stopped && !finish) throw new Error('the stream ended before the reply finished');
     return { usage, reasoningChars: reasoning, reasoningText, stopped,
         choices: [{ finish_reason: stopped ? 'think_budget' : finish,
             message: { content, ...(calls.length ? { tool_calls: calls.filter(Boolean) } : {}) } }] };
