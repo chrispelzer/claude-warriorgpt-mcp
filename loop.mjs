@@ -289,16 +289,25 @@ export async function runLoop(ctx) {
             if (!fixEnd && ctx.selfCheck && await passingNow()) finish(step - 1, '');
             else break;
         }
-        if (mode === 'verify' && verifyUntil && Date.now() >= verifyUntil) {
+        const timeUp = async () => {
             ctx.log(`--- verify time limit reached (${Math.round(ctx.verifyMs / 1000)} s)`);
             if (fixEnd) return selfCheckOut(step - 1, true);
             const passed = await passingNow();
             return { passed, finished: false, timedOut: true, steps: step - 1, summary: '', lastOutput: lastCheck.output, edits };
-        }
+        };
+        if (mode === 'verify' && verifyUntil && Date.now() >= verifyUntil) return timeUp();
         trimHistory(messages);
-        // verify steps get a fixed thinking budget (ctx.verifyThink), not doubled after a cut-off.
-        const reply = await ctx.chat(messages, { tools: toolSchemas(), maxTokens: ctx.maxTokens,
-            ...(mode === 'verify' && ctx.verifyThink ? { budgetScale: 1, thinkBudget: ctx.verifyThink } : { budgetScale: 2 ** cuts }) });
+        // verify steps get a fixed thinking budget (ctx.verifyThink), not doubled after a cut-off; the deadline
+        // cancels a request still running when time is up.
+        const deadline = mode === 'verify' ? verifyUntil : 0;
+        let reply;
+        try {
+            reply = await ctx.chat(messages, { tools: toolSchemas(), maxTokens: ctx.maxTokens, ...(deadline ? { deadline } : {}),
+                ...(mode === 'verify' && ctx.verifyThink ? { budgetScale: 1, thinkBudget: ctx.verifyThink } : { budgetScale: 2 ** cuts }) });
+        } catch (err) {
+            if (deadline && Date.now() >= deadline) return timeUp();
+            throw err;
+        }
         ctx.log(`\n--- ${mode} step ${step} of ${limit}: (${reply.usage.in} in / ${reply.usage.out} out, ` +
             `${reply.usage.reasoning} reasoning, finish ${reply.finish}, ${reply.toolCalls.length} tool call` +
             `${reply.toolCalls.length === 1 ? '' : 's'})${reply.text.trim() ? `\n${reply.text.trim()}` : ''}`);
