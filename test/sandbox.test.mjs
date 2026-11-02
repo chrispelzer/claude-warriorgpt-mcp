@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runNodeArgs, PERMISSION_FLAG } from '../ask.mjs';
@@ -18,6 +18,23 @@ test('run_node args: permission flag, reads in the tree and readOnly dirs, write
     assert.ok(args.includes('--allow-fs-read=/w/copy') && args.includes('--allow-fs-read=/w/orig'));
     assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), ['--allow-fs-write=/w/copy']);
     assert.ok(!args.some((a) => /allow-(child-process|worker|addons)/.test(a)));
+});
+
+test('run_node args: a linked tree is allowed by its real path too (macOS /var -> /private/var)', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'wgpt-link-')));
+    const real = join(root, 'real');
+    const link = join(root, 'link');
+    mkdirSync(real);
+    symlinkSync(real, link, 'junction');
+    try {
+        const args = runNodeArgs(link);
+        assert.ok(args.includes(`--allow-fs-read=${link}`) && args.includes(`--allow-fs-read=${real}`));
+        assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), [`--allow-fs-write=${link}`, `--allow-fs-write=${real}`]);
+        writeFileSync(join(real, 'one.txt'), 'hello\n');
+        assert.match(snippet(link, "import { readFileSync } from 'node:fs'; console.log(readFileSync('./one.txt', 'utf8'));"), /hello/);
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test('a snippet can import and write in its tree, but cannot spawn or write outside it', () => {
