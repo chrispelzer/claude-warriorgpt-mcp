@@ -4,7 +4,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -707,4 +707,92 @@ test('verify: when the check never passes, no verify request goes out at all', (
         [block(one, edit('start', 'bad')), tools(['run_check'])]);
     assert.equal(isError, true);
     assert.equal(requests().length, 2, 'the attempt and one loop step; nothing after the failed check');
+});
+
+test('runLoop: edit fills an existing empty file; an empty search on a file with text is still refused', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, '');
+    const { ctx, seen } = fakeCtx([
+        { calls: [['edit', { path: 'f.txt', search: '', replace: 'x' }]] },
+        { calls: [['edit', { path: 'f.txt', search: '', replace: 'y' }]] },
+        { calls: [['done', {}]] },
+    ], { files: [f], maxSteps: 3 });
+    await runLoop(ctx);
+    const results = seen.at(-1).filter((m) => m.role === 'tool').map((m) => m.content);
+    assert.match(results[0], /^filled f\.txt/);
+    assert.match(results[1], /search is empty/);
+    assert.equal(readFileSync(f, 'utf8'), 'x\n');
+});
+
+test('runLoop: read_file does not follow a link out of the working directory', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'warriorgpt-outside-'));
+    writeFileSync(join(outside, 'secret.txt'), 'TOP SECRET');
+    const tree = join(dir, 'tree');
+    mkdirSync(tree);
+    writeFileSync(join(tree, 'own.txt'), 'mine');
+    symlinkSync(outside, join(tree, 'link'), 'junction');
+    try {
+        const { ctx, seen } = fakeCtx([
+            { calls: [['read_file', { path: 'link/secret.txt' }], ['read_file', { path: 'own.txt' }]] },
+            { text: 'stop' },
+        ], { cwd: tree, maxSteps: 2 });
+        await runLoop(ctx);
+        const results = seen[1].filter((m) => m.role === 'tool').map((m) => m.content);
+        assert.match(results[0], /outside the working directory/);
+        assert.match(results[1], /mine/, 'a file in the tree is still read');
+        assert.ok(!seen.flat().some((m) => String(m.content).includes('TOP SECRET')));
+    } finally {
+        rmSync(outside, { recursive: true, force: true });
+    }
+});
+
+test('runLoop: a run_node that changes a task file counts as an edit, so done runs the check again', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, 'good\n');
+    let checks = 0;
+    const { ctx, seen } = fakeCtx([
+        { calls: [['run_check']] },
+        { calls: [['run_node', { code: 'writes f.txt' }]] },
+        { calls: [['done', { summary: 's' }]] },
+    ], { files: [f], maxSteps: 3,
+        runCheck: async () => { checks++; const ok = readFileSync(f, 'utf8') === 'good\n'; return { ok, code: ok ? 0 : 1, output: ok ? 'ok' : 'broken' }; },
+        runNode: async () => { writeFileSync(f, 'bad\n'); return { ok: true, code: 0, output: '' }; } });
+    const res = await runLoop(ctx);
+    assert.equal(checks, 2, 'done did not reuse the pass from before the snippet');
+    assert.equal(res.passed, false);
+});
+
+test('runLoop: a done followed by an edit in the same reply is not accepted', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, 'a\n');
+    const { ctx, seen } = fakeCtx([
+        { calls: [['done', { summary: 'early' }], ['edit', { path: 'f.txt', search: 'a', replace: 'b' }]] },
+        { calls: [['done', { summary: 'late' }]] },
+    ], { files: [f], maxSteps: 3, runCheck: async () => ({ ok: true, code: 0, output: 'ok' }) });
+    const res = await runLoop(ctx);
+    assert.equal(res.finished, true);
+    assert.equal(res.steps, 2);
+    assert.equal(res.summary, 'late');
+    assert.ok(seen[1].some((m) => m.role === 'user' && /changed files after calling done/.test(m.content)));
+});
+
+test('runLoop: the verify time limit cancels a request still in flight; other errors still throw', async () => {
+    const ok = async () => ({ ok: true, code: 0, output: 'ok' });
+    const { ctx } = fakeCtx([{ calls: [['run_check']] }], { mode: 'verify', verifyMs: 100, runCheck: ok });
+    let deadline;
+    // The fake request only ends when its deadline cancels it.
+    ctx.chat = (m, o) => {
+        deadline = o.deadline;
+        return new Promise((_, reject) => setTimeout(() => reject(new Error('cancelled')), Math.max(0, o.deadline - Date.now()) + 5));
+    };
+    const t0 = Date.now();
+    const res = await runLoop(ctx);
+    assert.equal(typeof deadline, 'number');
+    assert.equal(res.timedOut, true);
+    assert.equal(res.finished, false);
+    assert.ok(Date.now() - t0 < 2000, `took ${Date.now() - t0} ms`);
+
+    const { ctx: ctx2 } = fakeCtx([], { mode: 'verify', verifyMs: 60000, runCheck: ok });
+    ctx2.chat = async () => { throw new Error('boom'); };
+    await assert.rejects(runLoop(ctx2), /boom/);
 });
