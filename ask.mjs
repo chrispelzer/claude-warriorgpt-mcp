@@ -1,6 +1,6 @@
 // The ask_warriorgpt core, shared by the MCP server and the warriorgpt-ask CLI.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync } from 'node:fs';
 import { dirname, resolve, join, sep } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
 import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS } from './loop.mjs';
@@ -401,9 +401,17 @@ const [NODE_MAJOR, NODE_MINOR] = process.versions.node.split('.').map(Number);
 // --permission is stable from Node 22.13 / 23.5; older 22.x only has the experimental flag.
 export const PERMISSION_FLAG = NODE_MAJOR > 23 || (NODE_MAJOR === 23 && NODE_MINOR >= 5) || (NODE_MAJOR === 22 && NODE_MINOR >= 13)
     ? '--permission' : '--experimental-permission';
+// Each path is allowed as given and as its real path: the permission model checks real paths, and on macOS the
+// temp folder /var/... is a link to /private/var/....
+const withReal = (d) => {
+    let real = d;
+    try { real = realpathSync(d); } catch { /* missing: allow it as given */ }
+    return real === d ? [d] : [d, real];
+};
 export function runNodeArgs(cwd, readOnly = []) {
-    const reads = [cwd, ...readOnly.filter((d) => d && d !== cwd)];
-    return [PERMISSION_FLAG, ...reads.map((d) => `--allow-fs-read=${d}`), `--allow-fs-write=${cwd}`, '--input-type=module', '-'];
+    const reads = [...new Set([cwd, ...readOnly].filter(Boolean).flatMap(withReal))];
+    return [PERMISSION_FLAG, ...reads.map((d) => `--allow-fs-read=${d}`), ...withReal(cwd).map((d) => `--allow-fs-write=${d}`),
+        '--input-type=module', '-'];
 }
 const runNode = (code, cwd, signal, readOnly) => runProcess(process.execPath, runNodeArgs(cwd, readOnly),
     { cwd, timeoutS: NODE_TIMEOUT_S, input: code, signal });
