@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, lstatSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, lstatSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeCopy, inside } from '../workspace.mjs';
+import { makeCopy, inside, CantCopyError, TooBigError } from '../workspace.mjs';
 
 function tree() {
     const root = mkdtempSync(join(tmpdir(), 'warriorgpt-ws-test-'));
@@ -60,5 +60,23 @@ test('a temp folder inside the tree is not used, and copies being made at the sa
         assert.ok(!inside(root, c.dir), `${c.dir} is outside the tree`);
         assert.deepEqual(readdirSync(join(c.dir)).filter((n) => n.startsWith('wgpt-attempt-')), []);
         await c.cleanup();
+    }
+});
+
+test('a linked folder or a broken link in the tree refuses the copy with CantCopyError, which TooBigError extends', async () => {
+    assert.ok(new TooBigError('x') instanceof CantCopyError, 'both fall back to one attempt at a time');
+    const elsewhere = mkdtempSync(join(tmpdir(), 'warriorgpt-ws-elsewhere-'));
+    const cases = [['linked folder', (root) => symlinkSync(elsewhere, join(root, 'src', 'shared'), 'junction')]];
+    // A file link needs admin rights on Windows.
+    if (process.platform !== 'win32') cases.push(['broken link', (root) => symlinkSync('missing-target', join(root, 'src', 'gone'))]);
+    try {
+        for (const [what, make] of cases) {
+            const root = tree();
+            make(root);
+            await assert.rejects(makeCopy(root), (err) => err instanceof CantCopyError && err.message.includes(what));
+            rmSync(root, { recursive: true, force: true });
+        }
+    } finally {
+        rmSync(elsewhere, { recursive: true, force: true });
     }
 });

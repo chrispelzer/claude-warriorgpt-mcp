@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseBlocks, findMatch, replaceOnce, applyEdits } from '../edits.mjs';
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parseBlocks, findMatch, replaceOnce, applyEdits, writeText } from '../edits.mjs';
 
 const edit = (search, replace) => `<<<<<<< SEARCH\n${search}\n=======\n${replace}\n>>>>>>> REPLACE`;
 
@@ -67,4 +70,19 @@ test('applyEdits: reports loose matches and keeps going after a failed edit', ()
     assert.deepEqual(res.fuzzy, ['indentation-flexible']);
     assert.deepEqual(res.errors, ['edit 2: search text not found']);
     assert.equal(res.content, 'A\nB\nc\n');
+});
+
+test('writeText keeps the file mode: an executable stays executable, a private file stays private', { skip: process.platform === 'win32' }, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'warriorgpt-mode-'));
+    try {
+        for (const mode of [0o755, 0o600]) {
+            const f = join(dir, `f-${mode.toString(8)}`);
+            writeFileSync(f, 'old\n');
+            chmodSync(f, mode);
+            writeText(f, 'new\n', false);
+            assert.equal(statSync(f).mode & 0o777, mode);
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
 });
