@@ -46,8 +46,9 @@ const withLockRetry = (fn) => {
     for (let n = 0; ; n++) {
         try { return fn(); }
         catch (err) {
-            if (n >= 4 || (err.code !== 'EBUSY' && err.code !== 'EPERM')) throw err;
-            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 * (n + 1));
+            // Up to ~1.4 s in all: 100 ms was not enough on a CI runner.
+            if (n >= 7 || (err.code !== 'EBUSY' && err.code !== 'EPERM')) throw err;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (n + 1));
         }
     }
 };
