@@ -3,25 +3,26 @@
 // session can hand text generation to WarriorGPT without going through opencode.
 
 import { createInterface } from 'node:readline';
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync } from 'node:fs';
-import { dirname, resolve, join } from 'node:path';
-import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
-
-const API_URL = `${API_BASE}/chat/completions`;
-const MODELS = {
-    'local.qwen3.8-27b': 'Qwen 3.8 27B, 262k context. Best general coder (default).',
-    'local.gpt-oss-120b': 'GPT-OSS 120B, 131k context. Stronger reasoning, slower.',
-    'local.laguna-s-2.1': 'Laguna S 2.1, 131k context.',
-    'local.gemma-4-31b': 'Gemma 4 31B, 131k context.',
-};
+import { DEFAULT_MODEL } from './common.mjs';
+import { MODELS, runAsk } from './ask.mjs';
 
 const TOOL = {
     name: 'ask_warriorgpt',
     description:
-        'Send a prompt to a WarriorGPT model (Wayne State, free) and get its text reply. It cannot read the ' +
-        'repo or run commands; give it everything it needs. Use context_files to attach files, and output_file ' +
-        '(one file) or files (several new or existing files, edited in place) to write the reply straight to ' +
-        'disk, so the content never passes through Claude. Review what it wrote.',
+        'Send a prompt to a WarriorGPT model (Wayne State, free) and get its text reply. Give it everything it ' +
+        'needs: use context_files to attach files, and output_file (one file) or files (several new or existing ' +
+        'files, edited in place) to write the reply straight to disk, so the content never passes through Claude. ' +
+        'With files, check runs a command after the edits (tests, a type check). If the first one-shot attempt ' +
+        'misses, the model gets tools (read_file, edit, run_check, and run_node, which runs a JavaScript snippet ' +
+        'with this Node and no shell) and works until the check passes or max_steps runs out. By default a ' +
+        'tool-loop lane races the one-shot attempts from the start, each attempt checked in its own copy of ' +
+        'the tree. verify adds a ' +
+        'round of the model\'s own spec checks after the check passes. If the check never passes, every file is ' +
+        'restored and the result says fallback: opencode, meaning hand the task to a full coding agent. ' +
+        'With verify, structuredContent carries verified: true when the self-check finished, false when it ran out ' +
+        'of steps; either way the files pass the check. ' +
+        'This call blocks until it finishes; for checked or multi-attempt tasks, run the warriorgpt-ask ' +
+        'CLI with Bash in the background instead. Review what it wrote.',
     inputSchema: {
         type: 'object',
         properties: {
@@ -50,169 +51,32 @@ const TOOL = {
                     'existing ones. Every block is checked first: if any fails, nothing is written. ' +
                     'Not with output_file.',
             },
-            max_tokens: { type: 'integer', description: 'Max output tokens (default 32768).' },
+            check: {
+                type: 'string',
+                description: 'With files: a shell command run after the edits are written, such as the tests that ' +
+                    'should pass. On failure the tool loop starts (or, with loop: false, the model retries with the ' +
+                    'output); if it never passes, every listed file is restored. Runs locally like any command you run.',
+            },
+            cwd: { type: 'string', description: 'Directory to run check in. Default: the common folder of files.' },
+            loop: { type: 'boolean', description: 'With check: after a missed first attempt, switch to the tool loop (default true). false retries whole replies instead (max_attempts).' },
+            parallel: { type: 'integer', description: 'With check: one-shot attempts sent at once, each checked in its own copy of the tree, raced by the loop lane from the start; the first to pass wins and the rest are cancelled (default 1, max 6).' },
+            loop_lane: { type: 'boolean', description: 'With check: a tool-loop lane races the one-shot attempts from the start, in its own copy of the tree (default true). false: the one-shot attempts go first, then the loop starts from their best.' },
+            max_steps: { type: 'integer', description: 'With check: tool-loop steps after a missed first attempt (default 30, max 40).' },
+            verify: { type: 'boolean', description: 'With check: after it passes, the model tests the spec rules the check does not cover with its own node:assert snippets and fixes genuine failures (default false). If it cannot finish, its changes are undone.' },
+            max_attempts: { type: 'integer', description: 'With check and loop: false: attempts before giving up (default 3, max 5).' },
+            check_timeout_s: { type: 'integer', description: 'With check: seconds before a run is killed (default 300).' },
+            temperature: { type: 'number', description: "Temperature for the first attempt. Default 0.6 for Qwen models (sent with Qwen's recommended top_p, top_k and presence penalty); the server's own for others." },
+            retry_temperature_step: { type: 'number', description: 'With check: added to the temperature on each retry, capped at 0.8 (default 0.1; 0 keeps it flat).' },
+            log_file: { type: 'string', description: 'Absolute path. Every reply and check output is appended there, for diagnosing a miss.' },
+            max_tokens: { type: 'integer', description: 'Max output tokens for the first reply (default 16384).' },
+            loop_max_tokens: { type: 'integer', description: 'Max output tokens per tool-loop or verify step (default 8192).' },
+            think_budget: { type: 'integer', description: 'Edit tasks: once a reply has thought this many tokens with nothing written, it is cut off and the model is asked for the edits with its analysis so far (default 4096; 0 = no budget).' },
+            loop_think_budget: { type: 'integer', description: 'The same for tool-loop and verify steps (default 1536).' },
+            loop_thinking: { type: 'string', enum: ['auto', 'on', 'off'], description: 'Ask the server to skip thinking in loop steps: auto after a runaway (default), off always, on never.' },
         },
         required: ['prompt'],
     },
 };
-
-const FILES_FORMAT = `Reply with only file blocks and no other text. For each file you create or change:
-
-=== FILE: <absolute path> ===
-<body>
-=== END FILE ===
-
-For a new file, the body is the complete file contents. For an existing file, the body is one or more
-edit blocks instead:
-
-<<<<<<< SEARCH
-lines copied exactly from the current file, enough of them to match only one place
-=======
-the lines that replace them
->>>>>>> REPLACE
-
-Only write files from the allowed list, and leave out files that need no change.`;
-
-// Models often wrap a whole file in one fence despite being told not to.
-function unfence(text) {
-    const m = text.trim().match(/^```[^\n]*\n([\s\S]*?)\n```$/);
-    return m ? m[1] : text.trim();
-}
-
-function matchAllowed(path, allowed) {
-    const abs = resolve(path);
-    if (allowed.includes(abs)) return abs;
-    // Models sometimes shorten the path; accept it if it names exactly one allowed file.
-    const tail = '/' + path.replace(/\\/g, '/').replace(/^\.?\//, '');
-    const hits = allowed.filter((a) => a.replace(/\\/g, '/').endsWith(tail));
-    return hits.length === 1 ? hits[0] : null;
-}
-
-function applyEdits(content, body) {
-    const errors = [];
-    let edits = 0;
-    for (const [, search, replace] of body.matchAll(/<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n?>>>>>>> REPLACE/g)) {
-        const count = content.split(search).length - 1;
-        if (count !== 1) {
-            errors.push(`edit ${edits + 1}: search text ${count ? `matches ${count} places` : 'not found'}`);
-        } else {
-            // An empty replacement deletes the lines, so drop the newline after them too.
-            const at = content.indexOf(search);
-            const end = at + search.length + (replace === '' && content[at + search.length] === '\n' ? 1 : 0);
-            content = content.slice(0, at) + replace + content.slice(end);
-        }
-        edits++;
-    }
-    if (!edits) errors.push('no edit blocks found');
-    return { content, edits, errors };
-}
-
-// Works out every write in memory first, so a bad block leaves all files untouched.
-function writeFiles(text, allowed, stats) {
-    const blocks = [...text.matchAll(/^=== FILE: (.+?) ===\n([\s\S]*?)\n?^=== END FILE ===$/gm)];
-    if (!blocks.length) throw new Error(`Reply had no file blocks (${stats}); nothing written.`);
-
-    const plan = new Map();
-    const errors = [];
-    for (const [, rawPath, body] of blocks) {
-        const path = matchAllowed(rawPath.trim(), allowed);
-        if (!path) {
-            errors.push(`${rawPath.trim()}: not in files`);
-            continue;
-        }
-        const prev = plan.get(path);
-        const original = prev ? null : existsSync(path) ? readFileSync(path, 'utf8') : null;
-        const crlf = prev ? prev.crlf : original?.includes('\r\n') ?? false;
-        const current = prev ? prev.content : original?.replace(/\r\n/g, '\n') ?? null;
-        if (body.includes('<<<<<<< SEARCH')) {
-            if (current === null) {
-                errors.push(`${path}: edit blocks for a file that does not exist`);
-                continue;
-            }
-            const res = applyEdits(current, body);
-            errors.push(...res.errors.map((e) => `${path}: ${e}`));
-            plan.set(path, { content: res.content, crlf, created: prev?.created ?? false,
-                edits: (prev?.edits ?? 0) + res.edits });
-        } else {
-            plan.set(path, { content: unfence(body).replace(/\n*$/, '\n'), crlf,
-                created: prev ? prev.created : current === null, edits: prev?.edits ?? 0 });
-        }
-    }
-    if (errors.length) throw new Error(`Nothing written (${stats}):\n- ${errors.join('\n- ')}`);
-
-    const lines = [];
-    for (const [path, f] of plan) {
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, f.crlf ? f.content.replace(/\n/g, '\r\n') : f.content);
-        lines.push(f.created ? `created ${path} (${f.content.split('\n').length - 1} lines)`
-            : f.edits ? `edited ${path} (${f.edits} edit${f.edits === 1 ? '' : 's'})` : `rewrote ${path}`);
-    }
-    const untouched = allowed.filter((a) => !plan.has(a));
-    if (untouched.length) lines.push(`unchanged: ${untouched.join(', ')}`);
-    return `${lines.join('\n')}\n(${stats})`;
-}
-
-async function askWarriorGPT(args) {
-    const key = apiKey();
-    if (!key) throw new Error(missingKeyMessage());
-
-    if (args.files?.length && args.output_file) throw new Error('Pass files or output_file, not both.');
-    const files = (args.files || []).map((p) => resolve(p));
-    const model = args.model || DEFAULT_MODEL;
-    let user = args.prompt;
-    for (const path of args.context_files || []) {
-        const abs = resolve(path);
-        user += `\n\nFile: ${abs}\n\`\`\`\n${readFileSync(abs, 'utf8')}\n\`\`\``;
-    }
-    if (files.length) {
-        user += `\n\nAllowed files:\n${files.map((f) => `- ${f}${existsSync(f) ? '' : ' (new)'}`).join('\n')}`;
-        for (const f of files.filter((f) => existsSync(f))) {
-            user += `\n\nFile: ${f}\n\`\`\`\n${readFileSync(f, 'utf8')}\n\`\`\``;
-        }
-    }
-    const system = [
-        args.system,
-        args.output_file && 'Reply with only the complete contents of the requested file: no explanation, no markdown fences.',
-        files.length && FILES_FORMAT,
-    ].filter(Boolean).join('\n\n');
-    const messages = [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content: user }];
-
-    const activeFile = join(STATE_DIR, `active-${SESSION}`);
-    mkdirSync(STATE_DIR, { recursive: true });
-    writeFileSync(activeFile, '');
-    let data;
-    try {
-        const res = await fetch(API_URL, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model, messages, max_tokens: args.max_tokens || 32768 }),
-            signal: AbortSignal.timeout(15 * 60 * 1000),
-        });
-        if (!res.ok) throw new Error(`WarriorGPT ${res.status}: ${(await res.text()).slice(0, 500)}`);
-        data = await res.json();
-    } finally {
-        rmSync(activeFile, { force: true });
-    }
-
-    const usage = { in: data.usage?.prompt_tokens || 0, out: data.usage?.completion_tokens || 0 };
-    appendFileSync(join(STATE_DIR, 'usage.jsonl'),
-        JSON.stringify({ ts: new Date().toISOString(), session: SESSION, model, ...usage }) + '\n');
-
-    const choice = data.choices?.[0];
-    const text = choice?.message?.content ?? '';
-    const stats = `${model}, ${usage.in} in / ${usage.out} out tokens`;
-    if (choice?.finish_reason === 'length') {
-        throw new Error(`Reply was cut off at max_tokens (${stats}); nothing written. Split the task or raise max_tokens.`);
-    }
-    if (files.length) return writeFiles(text, files, stats);
-    if (!args.output_file) return `${text.trim()}\n\n(${stats})`;
-
-    const out = resolve(args.output_file);
-    const body = unfence(text) + '\n';
-    mkdirSync(dirname(out), { recursive: true });
-    writeFileSync(out, body);
-    return `Wrote ${body.split('\n').length - 1} lines to ${out} (${stats}).`;
-}
 
 function send(msg) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
@@ -234,8 +98,18 @@ async function handle(req) {
         case 'tools/call':
             if (params?.name !== TOOL.name) return send({ id, error: { code: -32602, message: `Unknown tool ${params?.name}` } });
             try {
-                const text = await askWarriorGPT(params.arguments || {});
-                return send({ id, result: { content: [{ type: 'text', text }] } });
+                const res = await runAsk(params.arguments || {});
+                const content = [{ type: 'text', text: res.text }];
+                // verified false: the check passes, but the self-check did not finish.
+                if (res.ok && res.verified !== undefined) {
+                    return send({ id, result: { content, structuredContent: { ok: true, verified: res.verified,
+                        ...(res.fallback ? { fallback: res.fallback } : {}), attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}) } } });
+                }
+                if (res.ok) return send({ id, result: { content } });
+                // No attempt passed the check: say so in a form a client can branch on.
+                return send({ id, result: { content, isError: true,
+                    structuredContent: { ok: false, fallback: res.fallback, attempts: res.attempts,
+                        ...(res.steps ? { steps: res.steps } : {}) } } });
             } catch (err) {
                 return send({ id, result: { content: [{ type: 'text', text: err.message }], isError: true } });
             }

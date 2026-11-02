@@ -5,6 +5,7 @@
   "type": "module",
   "bin": {
     "warriorgpt-mcp": "warriorgpt-mcp.mjs",
+    "warriorgpt-ask": "warriorgpt-ask.mjs",
     "warriorgpt-delegate": "warriorgpt-delegate.mjs"
   },
   "scripts": {
@@ -12,6 +13,11 @@
   },
   "files": [
     "warriorgpt-mcp.mjs",
+    "ask.mjs",
+    "edits.mjs",
+    "loop.mjs",
+    "workspace.mjs",
+    "warriorgpt-ask.mjs",
     "warriorgpt-delegate.mjs",
     "common.mjs",
     "delegate/",
