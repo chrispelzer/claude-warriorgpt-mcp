@@ -336,6 +336,8 @@ function killTree(child) {
 // stdin is the JSON-RPC stream. signal kills it early; the result carries ms, spawn to exit.
 function runProcess(command, args, { cwd, timeoutS, shell = false, input, signal }) {
     return new Promise((done) => {
+        // Cancelled while it waited for a check slot or a tree copy: a listener added now would never fire.
+        if (signal?.aborted) return done({ ok: false, code: null, timedOut: false, cancelled: true, output: '', ms: 0 });
         const t0 = performance.now();
         // The key stays out of the child: a model-written snippet could otherwise print it into the log.
         const env = { ...process.env };
