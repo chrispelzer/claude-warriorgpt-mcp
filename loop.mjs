@@ -2,7 +2,7 @@
 // (read_file, edit, run_check, run_node, done) until the check passes or the step cap is reached. It is also
 // used for the optional verify step, where the model tests the spec rules the check does not cover.
 
-import { readFileSync, existsSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { resolve, relative, isAbsolute } from 'node:path';
 import { matchAllowed, readText, writeText, replaceOnce } from './edits.mjs';
 
@@ -166,10 +166,12 @@ export async function runLoop(ctx) {
     // The self-check's deadline (ctx.verifyMs from when verify mode starts); 0: no time limit.
     let verifyUntil = mode === 'verify' && ctx.verifyMs ? Date.now() + ctx.verifyMs : 0;
     let nudged = false;
-    const inCwd = (abs) => {
-        const rel = relative(ctx.cwd, abs);
+    const inCwd = (abs, cwd = ctx.cwd) => {
+        const rel = relative(cwd, abs);
         return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
     };
+    const snapshot = () => new Map(ctx.files.map((f) => [f, existsSync(f) ? readFileSync(f) : null]));
+    const sameBytes = (a, b) => (a === null || b === null ? a === b : a.equals(b));
     let edits = 0;
     let lastCheck = { ok: false, at: -1, output: '' };
     let probes = 0;
@@ -192,6 +194,10 @@ export async function runLoop(ctx) {
             const abs = resolve(ctx.cwd, path);
             if (!inCwd(abs) && !ctx.readable.includes(abs)) return `error: ${path} is outside the working directory`;
             if (!existsSync(abs)) return `error: ${path} does not exist`;
+            // The check above is on the path as written; a link inside the tree must not lead out of it.
+            if (!ctx.readable.includes(abs) && !inCwd(realpathSync(abs), realpathSync(ctx.cwd))) {
+                return `error: ${path} is outside the working directory`;
+            }
             let text;
             try { text = readFileSync(abs, 'utf8'); } catch (err) { return `error: ${err.message}`; }
             text = text.replace(/\r\n/g, '\n');
