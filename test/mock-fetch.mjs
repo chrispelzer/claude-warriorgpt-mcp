@@ -10,7 +10,8 @@
 // MOCK_ROUTES (a JSON file {"substring": [replies]}) answers a request whose body contains the substring from
 // that list instead (each route keeps its own place, repeating its last reply). delay_ms on an object reply
 // holds the streamed body back that long, and honours the request's abort signal.
-// MOCK_UNREACHABLE makes fetch throw, as a network failure does. MOCK_STREAM answers as an SSE stream.
+// MOCK_UNREACHABLE makes fetch throw, as a network failure does. MOCK_STREAM answers as an SSE stream;
+// MOCK_NO_FINISH ends that stream after the content, with no finish reason, as a dropped connection does.
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 
 let calls = 0;
@@ -99,8 +100,8 @@ globalThis.fetch = async (url, init) => {
             deltas.push({ tool_calls: [{ index, function: { arguments: c.arguments.slice(cut) } }] });
         });
         const sse = deltas.map((d) => `data: ${JSON.stringify({ choices: [{ delta: d }] })}\n\n`).join('')
-            + `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finishOf(n, reply) }] })}\n\n`
-            + `data: ${JSON.stringify({ choices: [], usage: usageOf(reply) })}\n\ndata: [DONE]\n\n`;
+            + (process.env.MOCK_NO_FINISH ? '' : `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: finishOf(n, reply) }] })}\n\n`
+            + `data: ${JSON.stringify({ choices: [], usage: usageOf(reply) })}\n\ndata: [DONE]\n\n`);
         const enc = new TextEncoder();
         // Reasoning comes first and on its own, as it does live, so a thinking budget can cut the stream there.
         const lead = reply.reasoning_text ? sse.slice(0, sse.indexOf('\n\n') + 2) : '';

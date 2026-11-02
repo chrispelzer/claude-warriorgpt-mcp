@@ -89,6 +89,15 @@ test('a streamed reply cut off at max_tokens is still reported', () => {
     assert.match(text, /max_tokens|cut off/i);
 });
 
+test('a streamed reply that ends without a finish reason is an error, and output_file is not written', () => {
+    const out = join(dir, 'out', 'partial.txt');
+    const { text, isError } = call({ prompt: 'hi', output_file: out },
+        { reply: 'half a reply', env: { MOCK_STREAM: '1', MOCK_NO_FINISH: '1' } });
+    assert.equal(isError, true);
+    assert.match(text, /broke off: the stream ended before the reply finished/);
+    assert.equal(existsSync(out), false);
+});
+
 test('output_file writes the unfenced reply', () => {
     const out = join(dir, 'out', 'a.txt');
     const { text } = call({ prompt: 'x', output_file: out }, { reply: '```js\nconst a = 1;\n```' });
