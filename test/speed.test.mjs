@@ -67,31 +67,54 @@ test('budget: a first reply still thinking past the budget is cut off and reissu
     assert.match(reissue, /THE KEY INSIGHT\n>>>\n\nStop analysing\. Output the file blocks with your edits now\.$/);
     assert.equal(kw(reqs[0]), undefined, 'the first reply may think');
     assert.equal(kw(reqs[1]), false, 'the reissue asks the server to skip thinking');
-    assert.match(readFileSync(log, 'utf8'), /thinking passed the 4096-token budget with nothing written; reissued to write its edits now \(free retry 1 of 1\)/);
+    assert.match(readFileSync(log, 'utf8'), /thinking passed the 4096-token budget with nothing written; reissued to write its edits now, budget raised to 8192 tokens \(free retry 1 of 2\)/);
     assert.match(readFileSync(log, 'utf8'), /timing: headers \d+ ms, first reasoning \d+ ms, end \d+ ms/);
 });
 
-test('budget: replies that keep running over get two cut-offs in the race, then the loop takes over', () => {
-    // Cut-off reissues no longer exist twice in this path: the race reissues a budget cut-off once, then drops
-    // the attempt (runaway retries were removed from the race), and the tool loop starts from the untouched
-    // files. Its first step gets a thinking budget seeded from what the attempts spent thinking, so the
-    // over-thinker finishes its thinking instead of being cut off again.
+test('budget: replies that keep running over get two doubled budgets in the race, then the loop takes over', () => {
+    // The race reissues a budget cut-off with its analysis and twice the budget (8k, then 16k), then drops the
+    // attempt as out of thinking budget, and the tool loop starts from the untouched files. Its first step gets a
+    // thinking budget seeded from what the attempt spent thinking, at most 16k.
     const { one, check } = setup();
     const log = join(dir, 'run.log');
     const { text, isError } = call({ prompt: 'x', files: [one], check, log_file: log }, [
         { reasoning_text: LONG, content: 'never seen' },
-        { reasoning_text: LONG, content: 'never seen' },
+        { reasoning_text: `${LONG}${LONG}`, content: 'never seen' },
+        { reasoning_text: `${LONG}${LONG}${LONG}${LONG}`, content: 'never seen' },
         tools(['edit', { path: 'one.txt', search: 'start', replace: 'good' }], ['run_check']),
         tools(['done', { summary: 'ok' }]),
     ]);
     assert.equal(isError, false, text);
     assert.match(text, /^check passed in the tool loop at step 2 of \d+/);
+    assert.doesNotMatch(text, /warning:/, 'a pass is not blamed on the budget');
     assert.equal(readFileSync(one, 'utf8'), 'good\nkeep\n');
-    assert.equal(requests().length, 4);
+    const reqs = requests();
+    assert.equal(reqs.length, 5);
+    assert.deepEqual(reqs.slice(0, 3).map((r) => r.max_tokens), [16384, 16384, 24576]);
+    assert.match(reqs[2].messages.at(-1).content, /^Your analysis so far/);
     const out = readFileSync(log, 'utf8');
-    assert.match(out, /thinking passed the 4096-token budget with nothing written; reissued to write its edits now \(free retry 1 of 1\)/);
-    assert.match(out, /thinking passed the 4096-token budget with nothing written again; dropped/);
-    assert.match(out, /the loop's first step gets a \d+-token thinking budget/);
+    assert.match(out, /thinking passed the 4096-token budget with nothing written; reissued to write its edits now, budget raised to 8192 tokens \(free retry 1 of 2\)/);
+    assert.match(out, /thinking passed the 16384-token budget with nothing written again; dropped: out of thinking budget/);
+    assert.match(out, /the loop's first step gets a 16384-token thinking budget/);
+});
+
+test('budget: without the race, a cut-off is retried with twice the budget, and running out is reported as such', () => {
+    const { one, check } = setup();
+    const log = join(dir, 'run.log');
+    const { text, isError } = call({ prompt: 'x', files: [one], check, loop: false, max_attempts: 1, log_file: log }, [
+        { reasoning_text: LONG, content: 'never seen' },
+        { reasoning_text: `${LONG}${LONG}`, content: 'never seen' },
+        { content: '', finish: 'length', reasoning: 16384, out: 16384 },
+    ]);
+    assert.equal(isError, true);
+    const reqs = requests();
+    assert.equal(reqs.length, 3);
+    const out = readFileSync(log, 'utf8');
+    assert.match(out, /thinking passed the 4096-token budget with nothing written; cut off, free retry 1 of 2, budget raised to 8192 tokens/);
+    assert.match(out, /thinking passed the 8192-token budget with nothing written; cut off, free retry 2 of 2, with no budget/);
+    assert.match(text, /Last reply spent all of max_tokens thinking after 2 larger-budget retries/);
+    assert.match(text, /warning: attempt 1 ran out of thinking budget before writing any file/);
+    assert.match(out, /!!! WARNING: attempt 1 ran out of thinking budget/);
 });
 
 test('budget: think_budget 0 turns it off, and plain questions have none', () => {

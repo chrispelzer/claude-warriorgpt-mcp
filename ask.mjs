@@ -78,10 +78,14 @@ const VERIFY_STEPS = 8;
 // Parallel first attempts: vLLM batches them, so several cost about the time of one. Default to one: on hard tasks
 // the cut-off one-shot attempts lost every time to the always-on, uncut tool-loop lane.
 export const DEFAULT_PARALLEL = 1;
-// A race attempt still thinking past its budget after one reissue is dropped: such attempts never wrote anything.
-const RACE_FREE_RETRIES = 1;
-// The portfolio race: thinking budgets of 1x, 3x and 5x think_budget, each cut off once and reissued with a short
-// budget, then dropped. Output caps are budget + max_tokens, at most RACE_MAX_TOKENS, so no attempt stalls the race.
+// A race attempt cut off at its thinking budget is reissued with its analysis and twice the budget (up to
+// MAX_THINK_BUDGET), at most this often, then dropped as out of thinking budget: such attempts never wrote anything.
+const RACE_FREE_RETRIES = 2;
+const MAX_THINK_BUDGET = 16384;
+// Output room left for writing the edits after a raised thinking budget.
+const WRITE_ROOM = 8192;
+// The portfolio race: thinking budgets of 1x, 3x and 5x think_budget, each cut off and reissued with a doubled base
+// budget (RACE_FREE_RETRIES), then dropped. Output caps are budget + max_tokens, at most RACE_MAX_TOKENS, so no attempt stalls the race.
 const PORTFOLIO_SCALES = [1, 3, 5];
 const RACE_MAX_TOKENS = 32768;
 // The loop lane's output cap per step: with a bigger cap a step could think for minutes before its first tool call.
@@ -661,13 +665,17 @@ export async function runAsk(args) {
         const sampling = samplingFor(model, temp);
         let free = 0;
         let thought = 0; // reasoning tokens across its tries
+        let analysis = '';
+        // Budgeted on every try: an attempt that keeps thinking past it is dropped as a miss, since an unbudgeted try
+        // can stall the race. Each reissue after a cut-off doubles the base budget, with room left to write.
+        const budgetOf = (n) => (n ? Math.min(Math.min(budget, thinkBudget) * 2 ** n, MAX_THINK_BUDGET) : budget);
+        const capOf = (n) => (n ? Math.min(Math.max(cap, budgetOf(n) + WRITE_ROOM), Math.max(cap, RACE_MAX_TOKENS)) : cap);
         for (;;) {
             let reply;
             try {
-                // Budgeted on every try: an attempt that keeps thinking past it is dropped as a miss, since an unbudgeted try can stall the race.
-                // A reissue after a cut-off only has to write, so it gets the short budget; the wrap cuts one request, not the reissue after it.
-                reply = await chat(key, { model, messages: msgs, maxTokens: cap, attempt: 1, sampling,
-                    thinkBudget: free ? Math.min(budget, thinkBudget) : budget, noThinking: free > 0, signal,
+                // The wrap cuts one request, not the reissue after it.
+                reply = await chat(key, { model, messages: msgs, maxTokens: capOf(free), attempt: 1, sampling,
+                    thinkBudget: budgetOf(free), noThinking: free > 0, signal,
                     wrap: wrap?.aborted ? undefined : wrap });
             } catch (err) {
                 if (!(err instanceof CancelledError)) throw err;
@@ -682,14 +690,19 @@ export async function runAsk(args) {
             log(`    timing: ${timingText(reply.timing)}`);
             if (reply.finish === 'think_budget') {
                 runawaySeen = true;
-                const why = wrap?.aborted ? 'the other attempts are out: cut off' : `thinking passed the ${free ? Math.min(budget, thinkBudget) : budget}-token budget`;
+                const why = wrap?.aborted ? 'the other attempts are out: cut off' : `thinking passed the ${budgetOf(free)}-token budget`;
                 if (free >= RACE_FREE_RETRIES) {
-                    log(`--- ${tag} ${why} with nothing written again; dropped`);
-                    return { reply, thought, kind: 'think_budget', error: 'kept thinking past its budget; nothing written.' };
+                    log(`--- ${tag} ${why} with nothing written again; dropped: out of thinking budget`);
+                    return { reply, thought, kind: 'think_budget',
+                        error: `ran out of thinking budget (${budgetOf(free)} tokens on its last try) before writing any file; nothing written.` };
                 }
                 free++;
-                log(`--- ${tag} ${why} with nothing written; reissued to write its edits now (free retry ${free} of ${RACE_FREE_RETRIES})`);
-                msgs.push({ role: 'user', content: budgetPrompt(reply.reasoningText, true) });
+                log(`--- ${tag} ${why} with nothing written; reissued to write its edits now, budget raised to ${budgetOf(free)} tokens ` +
+                    `(free retry ${free} of ${RACE_FREE_RETRIES})`);
+                // One budget prompt at a time, carrying the analysis of every try so far.
+                analysis = analysis ? `${analysis}\n${reply.reasoningText}` : reply.reasoningText;
+                msgs.splice(base);
+                msgs.push({ role: 'user', content: budgetPrompt(analysis, true) });
                 continue;
             }
             // No runaway retries in the race: an attempt that spent its output on thinking (cut off, or a normal stop
@@ -851,6 +864,7 @@ export async function runAsk(args) {
     // Attempts that never wrote anything because they spent their thinking budget (or all their output) thinking.
     let outOfThinking = [];
     let outOfSteps = false;
+    const budgetAt = (n) => Math.min(thinkBudget * 2 ** n, Math.max(thinkBudget, MAX_THINK_BUDGET));
     let steps = 0;
     let passed = null;
     let attemptsMade = maxAttempts;
@@ -892,7 +906,7 @@ export async function runAsk(args) {
             if (!won) {
                 // What an attempt that finished its thinking (and wrote edits) used; if none did, the most any spent.
                 const finished = live.filter((r) => r.plan);
-                const need = Math.max(0, ...(finished.length ? finished : live).map((r) => r.thought || 0));
+                const need = Math.min(Math.max(0, ...(finished.length ? finished : live).map((r) => r.thought || 0)), MAX_THINK_BUDGET);
                 if (loopThinkBudget && need > loopThinkBudget) {
                     seqLoop.base = need;
                     log(`=== the loop's first step gets a ${need}-token thinking budget (what the longest-thinking attempt used)`);
@@ -926,10 +940,12 @@ export async function runAsk(args) {
         for (let attempt = 1; !raced && attempt <= maxAttempts; attempt++) {
             const temp = temperatureFor(attempt);
             const sampling = samplingFor(model, temp);
-            // A cut-off or runaway reply is reissued at most MAX_FREE_RETRIES times with a budget; after that the
-            // request runs to max_tokens, so the call always gets a real reply.
-            const reply = await chat(key, { model, messages, maxTokens, attempt: check ? attempt : 0, sampling,
-                thinkBudget: free < MAX_FREE_RETRIES ? thinkBudget : 0, noThinking: free > 0 });
+            // A cut-off or runaway reply is reissued at most MAX_FREE_RETRIES times, each with twice the thinking budget
+            // (up to MAX_THINK_BUDGET, with room to write); after that the request runs to max_tokens, so the call
+            // always gets a real reply.
+            const tryBudget = free < MAX_FREE_RETRIES ? budgetAt(free) : 0;
+            const reply = await chat(key, { model, messages, maxTokens: free && tryBudget ? Math.max(maxTokens, Math.min(tryBudget + WRITE_ROOM, RACE_MAX_TOKENS)) : maxTokens,
+                attempt: check ? attempt : 0, sampling, thinkBudget: tryBudget, noThinking: free > 0 });
             requests++;
             total.in += reply.usage.in;
             total.out += reply.usage.out;
@@ -943,8 +959,8 @@ export async function runAsk(args) {
             if (reply.finish === 'think_budget') {
                 free++;
                 runawaySeen = true;
-                log(`--- attempt ${attempt}: thinking passed the ${thinkBudget}-token budget with nothing written; cut off, ` +
-                    `free retry ${free} of ${MAX_FREE_RETRIES}`);
+                log(`--- attempt ${attempt}: thinking passed the ${tryBudget}-token budget with nothing written; cut off, ` +
+                    `free retry ${free} of ${MAX_FREE_RETRIES}${free < MAX_FREE_RETRIES ? `, budget raised to ${budgetAt(free)} tokens` : ', with no budget'}`);
                 messages.push({ role: 'user', content: budgetPrompt(reply.reasoningText, files.length > 0) });
                 attempt--;
                 continue;
@@ -961,7 +977,7 @@ export async function runAsk(args) {
             if (reply.finish === 'length') {
                 const thoughtOut = isRunaway(reply, files.length > 0, maxTokens);
                 if (thoughtOut) outOfThinking.push(`attempt ${attempt}`);
-                lastFailure = thoughtOut ? `reply spent all of max_tokens thinking (${stats}); nothing written.`
+                lastFailure = thoughtOut ? `reply spent all of max_tokens thinking after ${free} larger-budget retr${free === 1 ? 'y' : 'ies'} (${stats}); nothing written.`
                     : `reply was cut off at max_tokens (${stats}); nothing written.`;
                 if (!check) throw new Error(`Reply was cut off at max_tokens (${stats}); nothing written. Split the task or raise max_tokens.`);
                 retry(reply.text, isRunaway(reply, true) ? runawayPrompt(reply.usage.out, true) : cutOffPrompt(reply.usage.out));
@@ -1042,8 +1058,9 @@ export async function runAsk(args) {
                 '(for example, it is not testing the edited copy). Fix the check before handing the task on.');
         }
         if (outOfThinking.length) {
-            warn(`${outOfThinking.join(', ')} ran out of thinking budget before writing any file: that is the budget, ` +
-                'not a wrong answer. Raise think_budget (--think-budget), or split the task into smaller ones with explicit files.');
+            warn(`${outOfThinking.join(', ')} ran out of thinking budget before writing any file, with the budget doubled ` +
+                `on each retry up to ${MAX_THINK_BUDGET} tokens: that is the budget, not a wrong answer. Raise think_budget ` +
+                '(--think-budget), or split the task into smaller ones with explicit files.');
         }
         const notes = [
             outOfSteps && `the tool loop used all ${maxSteps} steps; max_steps (--max-steps) raises the cap, up to ${MAX_STEPS}.`,

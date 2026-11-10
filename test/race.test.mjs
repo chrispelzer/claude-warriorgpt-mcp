@@ -218,9 +218,13 @@ test('race: a portfolio of thinking budgets races the loop lane; when nothing pa
     // Each attempt is told apart by its output cap: 16384 (4k budget), 28672 (12k budget), 32768 (20k budget); the
     // loop lane is the only request that carries tools.
     const long = { reasoning_text: 'Let me think about this carefully. '.repeat(600), content: 'never seen' }; // ~5k tokens
+    // a1's reissues double its budget: 8k (same cap), then 16k (cap 24576); each thinks past it.
+    const longer = { reasoning_text: long.reasoning_text.repeat(2), content: 'never seen' }; // ~10k tokens
+    const longest = { reasoning_text: long.reasoning_text.repeat(4), content: 'never seen' }; // ~21k tokens
     writeFileSync(join(dir, 'routes.json'), JSON.stringify({
         '"tools"': [tools(['read_file', { path: 'one.txt' }])],
-        '"max_tokens":16384': [long, long],
+        '"max_tokens":16384': [long, longer],
+        '"max_tokens":24576': [longest],
         '"max_tokens":28672': [{ reasoning_text: long.reasoning_text, content: block(one, edit('start', 'alpha beta')) }],
         '"max_tokens":32768': [{ content: block(one, edit('start', 'alpha')), reasoning: 10000, out: 10500 }],
     }));
@@ -231,12 +235,17 @@ test('race: a portfolio of thinking budgets races the loop lane; when nothing pa
     assert.deepEqual(structured, { ok: false, fallback: 'opencode', attempts: 3, steps: 2 });
     const l = readFileSync(log, 'utf8');
     assert.match(l, /=== 3 parallel first attempts \(temperatures 0\.6, 0\.3, 0\.8; thinking budgets 4096, 12288, 20480; output caps 16384, 28672, 32768\)/);
-    assert.match(l, /\[a1\] thinking passed the 4096-token budget with nothing written; reissued to write its edits now \(free retry 1 of 1\)/);
-    assert.match(l, /\[a1\] thinking passed the 4096-token budget with nothing written again; dropped/);
+    assert.match(l, /\[a1\] thinking passed the 4096-token budget with nothing written; reissued to write its edits now, budget raised to 8192 tokens \(free retry 1 of 2\)/);
+    assert.match(l, /\[a1\] thinking passed the 8192-token budget with nothing written; reissued to write its edits now, budget raised to 16384 tokens \(free retry 2 of 2\)/);
+    assert.match(l, /\[a1\] thinking passed the 16384-token budget with nothing written again; dropped: out of thinking budget/);
+    assert.match(text, /warning: attempt 1 ran out of thinking budget before writing any file, with the budget doubled on each retry up to 16384 tokens: that is the budget, not a wrong answer/);
     assert.doesNotMatch(l, /\[a2\] thinking passed/, 'the 12k attempt was not cut off at ~5k tokens');
     assert.match(l, /no parallel attempt passed and the loop lane is out of steps; \[a2\] was closest \(1 failing\)/);
     assert.match(l, /=== no lane passed: neither the one-shot attempts nor the loop lane/);
-    assert.equal(requests().length, 6, 'two tries for a1, one each for a2 and a3, two steps for the lane');
+    assert.equal(requests().length, 7, 'three tries for a1, one each for a2 and a3, two steps for the lane');
+    const a1 = requests().filter((r) => !r.tools && r.max_tokens !== 28672 && r.max_tokens !== 32768);
+    assert.deepEqual(a1.map((r) => r.max_tokens), [16384, 16384, 24576], 'a 16k budget gets room to write');
+    assert.equal(a1[2].messages.filter((m) => m.role === 'user').length, 2, 'one budget prompt, not one per reissue');
     assert.equal(readFileSync(one, 'utf8'), 'start\n');
     assert.deepEqual(readdirSync(tmp), []);
 });
