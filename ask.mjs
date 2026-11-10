@@ -547,13 +547,12 @@ export function nodeModulesAbove(dir) {
     }
 }
 // Reads: the working directory, the readOnly paths (the original tree for a copy, attached files) and the
-// node_modules folders above them. Writes: the working directory only.
+// node_modules folders above them. No writes anywhere: a snippet once faked a virtualenv in the user's real tree.
 export function runNodeArgs(cwd, readOnly = []) {
     const roots = [cwd, ...readOnly].filter(Boolean);
     const dirs = roots.filter((d) => { try { return statSync(d).isDirectory(); } catch { return false; } });
     const reads = [...new Set([...roots, ...dirs.flatMap(nodeModulesAbove)].flatMap(withReal))];
-    return [PERMISSION_FLAG, ...reads.map((d) => `--allow-fs-read=${d}`), ...withReal(cwd).map((d) => `--allow-fs-write=${d}`),
-        '--input-type=module', '-'];
+    return [PERMISSION_FLAG, ...reads.map((d) => `--allow-fs-read=${d}`), '--input-type=module', '-'];
 }
 const runNode = (code, cwd, signal, readOnly) => runProcess(process.execPath, runNodeArgs(cwd, readOnly),
     { cwd, timeoutS: NODE_TIMEOUT_S, input: code, signal });

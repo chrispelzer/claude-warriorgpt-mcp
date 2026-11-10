@@ -59,10 +59,11 @@ export const TOOLS = [
         description: 'Run a JavaScript snippet with Node as an ES module in the working directory, and get its output. ' +
             'Use it to see what the code really does: import a project file with a relative path such as ' +
             '"./src/x.js", call it, and console.log the result; or assert expected behaviour with node:assert. ' +
-            'Snippets must not write files. They run sandboxed with Node\'s permission model: they may read the working ' +
-            'directory, the attached files and node_modules folders above the working directory; they may not read ' +
-            'anything else, write outside the working directory, or start processes, workers or addons. Use read_file ' +
-            'for files outside the working directory.',
+            'Snippets are read-only. They run sandboxed with Node\'s permission model: they may read the working ' +
+            'directory, the attached files and node_modules folders above the working directory; they may not write, ' +
+            'create, delete or link any file anywhere, read anything else, or start processes, workers or addons. ' +
+            'Change files only with edit, and use read_file for files outside the working directory. If the check ' +
+            'cannot run (a missing interpreter or path), do not work around it: the job stops so the caller can fix it.',
         parameters: { type: 'object', properties: {
             code: { type: 'string', description: 'The ES module source to run.' },
         }, required: ['code'] },
@@ -103,8 +104,8 @@ export function allowedFilesText(files, cwd) {
 // A snippet that hit the sandbox gets told the rules, so it does not try the same read again.
 const DENIED = /ERR_ACCESS_DENIED|Access to this API has been restricted/;
 const DENIED_HINT = '\n[run_node is sandboxed: it may read only the working directory, the attached files and node_modules ' +
-    'folders above the working directory, may write only in the working directory, and may not start processes. ' +
-    'Use read_file for other files.]';
+    'folders above the working directory, may not write, create, delete or link any file, and may not start processes. ' +
+    'Change files only with edit; use read_file for other files.]';
 
 // verify: once the check passes, the model tests the spec rules the tests miss.
 const VERIFY_STEPS_TEXT = `- Reread the task and the spec. Pick the rules the tests skip: edge cases, invalid inputs, exact error messages and
@@ -321,7 +322,7 @@ async function loop(ctx, saved) {
         async run_node({ code }) {
             if (typeof code !== 'string' || !code.trim()) return 'error: code is required';
             probes++;
-            // A snippet may write in the tree: a change to a task file counts as an edit, so a stale check
+            // Snippets cannot write, but if a task file changed anyway it counts as an edit, so a stale check
             // result is not reused and the rollback sees it.
             const before = snapshot();
             const ran = await ctx.runNode(code);

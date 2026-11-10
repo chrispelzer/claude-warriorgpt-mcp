@@ -4,7 +4,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -893,4 +893,25 @@ test('runLoop: a request over the context window is retried once with the histor
     n = 0;
     replies.splice(0, replies.length, 'overflow', 'overflow');
     await assert.rejects(runLoop(ctx), /over the model's context window even after trimming its history; split the task, or attach fewer or smaller context_files/);
+});
+
+test('loop: run_node in the real tree cannot write anything; only edit changes files', () => {
+    const { one, check } = setup();
+    const before = readdirSync(dir).sort();
+    const fake = "import fs from 'node:fs';\nfor (const f of [() => fs.mkdirSync('.venv/bin', { recursive: true }), " +
+        "() => fs.writeFileSync('sitecustomize.py', 'x'), () => fs.writeFileSync('one.txt', 'good')]) " +
+        "{ try { f(); console.log('wrote'); } catch (e) { console.log(e.code); } }";
+    const { text, isError } = call({ prompt: 'x', files: [one], check }, [
+        block(one, edit('start', 'bad')),
+        tools(['run_node', { code: fake }]),
+        tools(['edit', { path: 'one.txt', search: 'bad', replace: 'good' }], ['done', { summary: 'ok' }]),
+    ]);
+    assert.equal(isError, false, text);
+    const result = requests()[2].messages.find((m) => m.role === 'tool').content;
+    assert.equal(result.match(/ERR_ACCESS_DENIED/g)?.length, 3, result);
+    assert.doesNotMatch(result, /wrote/);
+    assert.match(result, /\[run_node is sandboxed: .*may not write, create, delete or link any file/);
+    assert.deepEqual(readdirSync(dir).sort(), [...before, 'home', 'replies.json', 'request.json', 'requests.jsonl'].filter((v, i, a) => a.indexOf(v) === i).sort(),
+        'no .venv, no sitecustomize.py');
+    assert.equal(readFileSync(one, 'utf8'), 'good\nkeep\n');
 });

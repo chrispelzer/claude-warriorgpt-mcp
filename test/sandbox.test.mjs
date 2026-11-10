@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, realpathSync, symlinkSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runNodeArgs, PERMISSION_FLAG } from '../ask.mjs';
@@ -12,11 +12,11 @@ function snippet(cwd, code, readOnly) {
     return (r.stdout + r.stderr).trim();
 }
 
-test('run_node args: permission flag, reads in the tree and readOnly dirs, writes only in the tree', () => {
+test('run_node args: permission flag, reads in the tree and readOnly dirs, no writes at all', () => {
     const args = runNodeArgs('/w/copy', ['/w/orig']);
     assert.equal(args[0], PERMISSION_FLAG);
     assert.ok(args.includes('--allow-fs-read=/w/copy') && args.includes('--allow-fs-read=/w/orig'));
-    assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), ['--allow-fs-write=/w/copy']);
+    assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), []);
     assert.ok(!args.some((a) => /allow-(child-process|worker|addons)/.test(a)));
 });
 
@@ -29,7 +29,7 @@ test('run_node args: a linked tree is allowed by its real path too (macOS /var -
     try {
         const args = runNodeArgs(link);
         assert.ok(args.includes(`--allow-fs-read=${link}`) && args.includes(`--allow-fs-read=${real}`));
-        assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), [`--allow-fs-write=${link}`, `--allow-fs-write=${real}`]);
+        assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), []);
         writeFileSync(join(real, 'one.txt'), 'hello\n');
         assert.match(snippet(link, "import { readFileSync } from 'node:fs'; console.log(readFileSync('./one.txt', 'utf8'));"), /hello/);
     } finally {
@@ -37,26 +37,37 @@ test('run_node args: a linked tree is allowed by its real path too (macOS /var -
     }
 });
 
-test('a snippet can import and write in its tree, but cannot spawn or write outside it', () => {
+test('a snippet can import and read in its tree, but cannot write anywhere, spawn, or touch the tree', () => {
     const root = mkdtempSync(join(tmpdir(), 'wgpt-sandbox-'));
     const tree = join(root, 'tree');
-    mkdirSync(tree);
+    mkdirSync(join(tree, 'src'), { recursive: true });
     writeFileSync(join(tree, 'm.mjs'), 'export const x = 41;\n');
     const outside = join(root, 'escape.txt');
+    const before = readdirSync(tree, { recursive: true }).sort();
     try {
+        // What a model did in a real run: fake a virtualenv and a sitecustomize in the tree.
         const out = snippet(tree, `
 import { x } from './m.mjs';
-import { writeFileSync } from 'node:fs';
-writeFileSync('inside.txt', 'ok');
-console.log('import', x + 1);
-try { (await import('node:child_process')).spawnSync(process.execPath, ['-e', '0']); console.log('spawn allowed'); }
-catch (e) { console.log('spawn', e.code); }
-try { writeFileSync(${JSON.stringify(outside)}, 'x'); console.log('outside allowed'); }
-catch (e) { console.log('outside', e.code); }`);
-        assert.match(out, /import 42/);
-        assert.match(out, /spawn ERR_ACCESS_DENIED/);
-        assert.match(out, /outside ERR_ACCESS_DENIED/);
-        assert.ok(existsSync(join(tree, 'inside.txt')));
+import fs from 'node:fs';
+console.log('import', x + 1, fs.readFileSync('m.mjs', 'utf8').trim());
+const tries = {
+    inside: () => fs.writeFileSync('inside.txt', 'ok'),
+    mkdir: () => fs.mkdirSync('.venv/bin', { recursive: true }),
+    nested: () => fs.writeFileSync('src/sitecustomize.py', 'x'),
+    append: () => fs.appendFileSync('m.mjs', '// x'),
+    symlink: () => fs.symlinkSync('/usr/bin/python3', 'python'),
+    outside: () => fs.writeFileSync(${JSON.stringify(outside)}, 'x'),
+    spawn: async () => (await import('node:child_process')).spawnSync(process.execPath, ['-e', '0']),
+};
+for (const [name, f] of Object.entries(tries)) {
+    try { await f(); console.log(name, 'allowed'); } catch (e) { console.log(name, e.code); }
+}`);
+        assert.match(out, /import 42 export const x = 41;/);
+        for (const name of ['inside', 'mkdir', 'nested', 'append', 'symlink', 'outside', 'spawn']) {
+            assert.match(out, new RegExp(`^${name} ERR_ACCESS_DENIED$`, 'm'), `${name} is denied:\n${out}`);
+        }
+        assert.deepEqual(readdirSync(tree, { recursive: true }).sort(), before, 'the tree is untouched');
+        assert.equal(readFileSync(join(tree, 'm.mjs'), 'utf8'), 'export const x = 41;\n');
         assert.ok(!existsSync(outside));
     } finally {
         rmSync(root, { recursive: true, force: true });
@@ -75,7 +86,7 @@ test('a snippet can import a package hoisted to a node_modules above the tree, a
     try {
         const args = runNodeArgs(tree, [join(root, 'spec.md')]);
         assert.ok(args.includes(`--allow-fs-read=${join(root, 'node_modules')}`), 'the hoisted node_modules is readable');
-        assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), [`--allow-fs-write=${tree}`], 'still writes only in the tree');
+        assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), [], 'no writes');
         const out = snippet(tree, `
 import h from 'hoisted';
 import { readFileSync } from 'node:fs';
