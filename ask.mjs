@@ -1,6 +1,6 @@
 // The ask_warriorgpt core, shared by the MCP server and the warriorgpt-ask CLI.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
 import { dirname, resolve, join, sep } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
 import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS } from './loop.mjs';
@@ -413,8 +413,20 @@ const withReal = (d) => {
     try { real = realpathSync(d); } catch { /* missing: allow it as given */ }
     return real === d ? [d] : [d, real];
 };
+// node_modules folders above a tree (a monorepo's hoisted packages): a bare import resolves through them.
+export function nodeModulesAbove(dir) {
+    const found = [];
+    for (let d = dirname(dir); ; d = dirname(d)) {
+        if (existsSync(join(d, 'node_modules'))) found.push(join(d, 'node_modules'));
+        if (d === dirname(d)) return found;
+    }
+}
+// Reads: the working directory, the readOnly paths (the original tree for a copy, attached files) and the
+// node_modules folders above them. Writes: the working directory only.
 export function runNodeArgs(cwd, readOnly = []) {
-    const reads = [...new Set([cwd, ...readOnly].filter(Boolean).flatMap(withReal))];
+    const roots = [cwd, ...readOnly].filter(Boolean);
+    const dirs = roots.filter((d) => { try { return statSync(d).isDirectory(); } catch { return false; } });
+    const reads = [...new Set([...roots, ...dirs.flatMap(nodeModulesAbove)].flatMap(withReal))];
     return [PERMISSION_FLAG, ...reads.map((d) => `--allow-fs-read=${d}`), ...withReal(cwd).map((d) => `--allow-fs-write=${d}`),
         '--input-type=module', '-'];
 }
@@ -564,6 +576,7 @@ export async function runAsk(args) {
         messages.push({ role: 'assistant', content: replyText }, { role: 'user', content: retryPrompt(check, failure, current()) });
     };
     let lastFailure = '';
+    const contextPaths = (args.context_files || []).map((p) => resolve(p));
 
     const changedFiles = () => {
         const changed = [];
@@ -610,8 +623,8 @@ export async function runAsk(args) {
     // history: continue that conversation (a winning one-shot attempt's) instead of starting one; the task is already
     // in it, so the user turn holds the tool instructions, the files as they are now and the lead.
     const loopRun = (mode, lead, steps, history = null) => runLoop({
-        chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...(args.context_files || []).map((p) => resolve(p))], cwd, mode,
-        runCheck: () => runCheck(check, cwd, checkTimeout), runNode: (code) => runNode(code, cwd), log,
+        chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...contextPaths], cwd, mode,
+        runCheck: () => runCheck(check, cwd, checkTimeout), runNode: (code) => runNode(code, cwd, undefined, contextPaths), log,
         maxSteps: steps, maxTokens: mode === 'verify' ? LANE_MAX_TOKENS : loopMaxTokens, onRunaway: () => { runawaySeen = true; }, system: mode === 'verify' ? VERIFY_SYSTEM : FIX_SYSTEM,
         ...(history ? { history } : {}), verifyThink: VERIFY_THINK_BUDGET, verifyMs: verifyMs,
         user: history
@@ -775,7 +788,7 @@ export async function runAsk(args) {
                     readable: seen, cwd: copy.dir, mode: 'fix', log: say, maxSteps, maxTokens: LANE_MAX_TOKENS,
                     ...(verify ? { selfCheck: { steps: Math.min(maxSteps, VERIFY_STEPS) }, verifyThink: VERIFY_THINK_BUDGET, verifyMs } : {}),
                     runCheck: () => checks(() => runCheck(laneCheck, copy.dir, checkTimeout, signal)),
-                    runNode: (code) => runNode(code, copy.dir, signal, [cwd]), onRunaway: () => { runawaySeen = true; }, system: FIX_SYSTEM,
+                    runNode: (code) => runNode(code, copy.dir, signal, [cwd, ...contextPaths]), onRunaway: () => { runawaySeen = true; }, system: FIX_SYSTEM,
                     user: `${args.prompt}${contextText}\n\nFiles you may change, as they are now:${now}\n\nWorking directory: ${copy.dir}\n` +
                         `Check command: ${laneCheck}\n\nMake the change with the tools: read what you need, edit, run the check, ` +
                         'and call done when it passes.',

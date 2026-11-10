@@ -54,7 +54,10 @@ export const TOOLS = [
         description: 'Run a JavaScript snippet with Node as an ES module in the working directory, and get its output. ' +
             'Use it to see what the code really does: import a project file with a relative path such as ' +
             '"./src/x.js", call it, and console.log the result; or assert expected behaviour with node:assert. ' +
-            'Snippets must not write files. They run sandboxed: no child processes, and no file access outside the working directory.',
+            'Snippets must not write files. They run sandboxed with Node\'s permission model: they may read the working ' +
+            'directory, the attached files and node_modules folders above the working directory; they may not read ' +
+            'anything else, write outside the working directory, or start processes, workers or addons. Use read_file ' +
+            'for files outside the working directory.',
         parameters: { type: 'object', properties: {
             code: { type: 'string', description: 'The ES module source to run.' },
         }, required: ['code'] },
@@ -81,6 +84,22 @@ const RULES = `How to work:
 - Never weaken, skip or delete a test, and never edit files outside the allowed list.`;
 
 export const FIX_SYSTEM = `You fix code until a check command passes, working through tools.\n\n${RULES}`;
+
+// Told up front, so the model does not spend steps on edits the edit tool refuses (helper files, the tests).
+export function allowedFilesText(files, cwd) {
+    const shown = files.map((f) => {
+        const rel = relative(cwd, f);
+        return rel && !rel.startsWith('..') && !isAbsolute(rel) ? rel : f;
+    });
+    return `Files you may change (edit refuses every other file; you can still read them): ${shown.join(', ') || '(none)'}. ` +
+        'If the fix seems to need another file, such as a new helper module, put that code in one of these files instead.';
+}
+
+// A snippet that hit the sandbox gets told the rules, so it does not try the same read again.
+const DENIED = /ERR_ACCESS_DENIED|Access to this API has been restricted/;
+const DENIED_HINT = '\n[run_node is sandboxed: it may read only the working directory, the attached files and node_modules ' +
+    'folders above the working directory, may write only in the working directory, and may not start processes. ' +
+    'Use read_file for other files.]';
 
 // verify: once the check passes, the model tests the spec rules the tests miss.
 const VERIFY_STEPS_TEXT = `- Reread the task and the spec. Pick the rules the tests skip: edge cases, invalid inputs, exact error messages and
@@ -158,8 +177,9 @@ function assistantTurn(reply, extra = {}) {
 export async function runLoop(ctx) {
     // ctx.history: an earlier conversation to continue (a winning one-shot attempt's, ending with its reply); ctx.user
     // then follows it and carries the instructions, since ctx.system is not sent.
-    const messages = ctx.history ? [...ctx.history, { role: 'user', content: ctx.user }]
-        : [{ role: 'system', content: ctx.system }, { role: 'user', content: ctx.user }];
+    const allowed = allowedFilesText(ctx.files, ctx.cwd);
+    const messages = ctx.history ? [...ctx.history, { role: 'user', content: `${ctx.user}\n\n${allowed}` }]
+        : [{ role: 'system', content: `${ctx.system}\n\n${allowed}` }, { role: 'user', content: ctx.user }];
     let mode = ctx.mode;
     let limit = ctx.maxSteps;
     let fixEnd = null; // set once the fix part finished and the self-check began
@@ -213,7 +233,10 @@ export async function runLoop(ctx) {
                 return 'error: path, search and replace must all be strings';
             }
             const target = matchAllowed(resolve(ctx.cwd, path), ctx.files) || matchAllowed(path, ctx.files);
-            if (!target) return `error: ${path} is not a file you may change. Allowed: ${ctx.files.join(', ')}`;
+            if (!target) {
+                return `error: ${path} is not a file you may change; it is read-only. Allowed: ${ctx.files.join(', ')}. ` +
+                    'Put the change in one of those files instead.';
+            }
             const cur = readText(target);
             if (!cur) {
                 if (search !== '') return `error: ${path} does not exist yet; create it with an empty search`;
@@ -252,7 +275,7 @@ export async function runLoop(ctx) {
                 ctx.log('--- run_node changed a task file; counted as an edit');
             }
             const head = ran.timedOut ? 'TIMED OUT' : `exit ${ran.code}`;
-            return `${head}\n${tail(ran.output, OUTPUT_CHARS) || '(no output)'}`;
+            return `${head}\n${tail(ran.output, OUTPUT_CHARS) || '(no output)'}${DENIED.test(ran.output) ? DENIED_HINT : ''}`;
         },
         async done({ summary }) {
             if (mode === 'verify' && !probes && doneRefusals++ === 0) {

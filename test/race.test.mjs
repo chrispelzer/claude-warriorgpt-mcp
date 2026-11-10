@@ -151,7 +151,7 @@ test('verify: when the lane wins, the self-check runs in its conversation and th
     assert.match(l, /=== verify: passed: the model's self-check found nothing to fix: the rules hold \(in the loop lane's conversation, 2 steps\)/);
     const sc = requests().find((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(SELF_CHECK_PROMPT)));
     assert.ok(sc, 'a request carries the self-check prompt');
-    assert.equal(sc.messages[0].content, FIX_SYSTEM, 'the lane keeps its own system prompt');
+    assert.ok(sc.messages[0].content.startsWith(FIX_SYSTEM), 'the lane keeps its own system prompt');
     assert.ok(sc.messages.some((m) => m.role === 'assistant' && m.tool_calls?.some((c) => c.function.name === 'edit')),
         'the fix turns lead the self-check');
     assert.deepEqual(readdirSync(tmp), [], 'every copy was removed');

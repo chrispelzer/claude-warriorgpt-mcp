@@ -74,7 +74,9 @@ for (const streamed of [true, false]) {
         assert.equal(reqs[0].tools, undefined, 'the one-shot attempt has no tools');
         assert.deepEqual(reqs[1].tools.map((t) => t.function.name), ['read_file', 'edit', 'run_check', 'run_node', 'done']);
         assert.equal(reqs[1].stream, true);
-        assert.equal(reqs[1].messages[0].content, FIX_SYSTEM);
+        assert.ok(reqs[1].messages[0].content.startsWith(FIX_SYSTEM));
+        assert.match(reqs[1].messages[0].content, /Files you may change \(edit refuses every other file; you can still read them\): one\.txt\./,
+            'the system prompt names the files the model may change');
         assert.match(reqs[1].messages[1].content, /make it good/);
         assert.match(reqs[1].messages[1].content, /one\.txt is NOT GOOD: bad/, 'the loop starts from the check output');
         assert.match(reqs[1].messages[1].content, /Check command: /);
@@ -457,7 +459,7 @@ test('runLoop: with selfCheck, an accepted done switches to the self-check in th
     assert.equal(res.summary, 'fixed it', 'the fix summary is kept');
     assert.deepEqual(res.selfCheck, { finished: true, steps: 2, edits: 0, summary: 'rules hold' });
     // The self-check rides on the fix conversation: the same system prompt, the fix turns still in front.
-    assert.equal(seen[2][0].content, FIX_SYSTEM, 'no new system message');
+    assert.ok(seen[2][0].content.startsWith(FIX_SYSTEM), 'no new system message');
     assert.equal(seen[2].at(-1).role, 'user');
     assert.equal(seen[2].at(-1).content, SELF_CHECK_PROMPT);
     assert.ok(seen[2].some((m) => m.role === 'assistant' && m.tool_calls?.some((c) => c.function.name === 'edit')),
@@ -795,4 +797,22 @@ test('runLoop: the verify time limit cancels a request still in flight; other er
     const { ctx: ctx2 } = fakeCtx([], { mode: 'verify', verifyMs: 60000, runCheck: ok });
     ctx2.chat = async () => { throw new Error('boom'); };
     await assert.rejects(runLoop(ctx2), /boom/);
+});
+
+test('runLoop: a snippet the sandbox stopped gets the rules with its output; the system prompt names the files to change', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, 'a\n');
+    const denied = "Error: Access to this API has been restricted. Use --allow-fs-read to manage permissions.\n  code: 'ERR_ACCESS_DENIED'";
+    const { ctx, seen } = fakeCtx([
+        { calls: [['run_node', { code: "readFileSync('/etc/hosts')" }], ['run_node', { code: '1' }]] },
+        { calls: [['edit', { path: 'helper.txt', search: '', replace: 'x' }]] },
+        { calls: [['done', { summary: 'x' }]] },
+    ], { files: [f], maxSteps: 3, runNode: async (code) => (code === '1' ? { ok: true, code: 0, output: 'fine' } : { ok: false, code: 1, output: denied }) });
+    await runLoop(ctx);
+    assert.match(seen[0][0].content, /Files you may change \(edit refuses every other file; you can still read them\): f\.txt\. If the fix seems to need another file/);
+    const results = seen[1].filter((m) => m.role === 'tool').map((m) => m.content);
+    assert.match(results[0], /ERR_ACCESS_DENIED'\n\[run_node is sandboxed: it may read only the working directory, the attached files and node_modules folders above/);
+    assert.doesNotMatch(results[1], /sandboxed/, 'a snippet that ran fine gets no hint');
+    const refused = seen[2].filter((m) => m.role === 'tool').at(-1).content;
+    assert.match(refused, /^error: helper\.txt is not a file you may change; it is read-only\. Allowed: .*f\.txt\. Put the change in one of those files instead\./);
 });
