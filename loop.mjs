@@ -37,7 +37,8 @@ export const TOOLS = [
         name: 'edit',
         description: 'Replace one piece of text in a file you may change. search must match one place in the current ' +
             'file (copy it from the file, without line numbers; small differences in indentation and spacing are ' +
-            'tolerated). Keep each edit small: one change per call. To create a new allowed file, pass an empty search.',
+            'tolerated). Do not include the line-number prefixes ("12: ") that read_file shows. Keep each edit small: one ' +
+            'change per call. To create a new allowed file, pass an empty search.',
         parameters: { type: 'object', properties: {
             path: { type: 'string', description: 'One of the files you may change.' },
             search: { type: 'string', description: 'The exact current text to replace (a few whole lines).' },
@@ -252,7 +253,10 @@ export async function runLoop(ctx) {
                 return `filled ${path}`;
             }
             const res = replaceOnce(cur.text, search, replace);
-            if (res.error) return `error: ${res.error}. Nothing changed. Read the file again and copy the search text exactly.`;
+            if (res.error) {
+                return `error: ${res.error}. Nothing changed. Read the file again and copy the search text exactly.` +
+                    `${res.hint ? `\n${res.hint}` : ''}`;
+            }
             writeText(target, res.content, cur.crlf);
             edits++;
             const at = res.content.slice(0, res.start).split('\n').length;

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseBlocks, findMatch, replaceOnce, applyEdits, writeText } from '../edits.mjs';
+import { parseBlocks, findMatch, replaceOnce, applyEdits, writeText, missHint } from '../edits.mjs';
 
 const edit = (search, replace) => `<<<<<<< SEARCH\n${search}\n=======\n${replace}\n>>>>>>> REPLACE`;
 
@@ -85,4 +85,36 @@ test('writeText keeps the file mode: an executable stays executable, a private f
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+test('findMatch: a search copied with read_file line numbers matches without them, still only once', () => {
+    const content = 'const a = 1;\nconst b = 2;\nconst c = 3;\n';
+    const res = replaceOnce(content, '2: const b = 2;\n3: const c = 3;', '2: const b = 20;\n3: const c = 30;');
+    assert.equal(res.how, 'line numbers removed');
+    assert.equal(res.content, 'const a = 1;\nconst b = 20;\nconst c = 30;\n', 'the numbers are left out of the replacement too');
+    assert.equal(replaceOnce(content, '2: const b = 2;', 'const b = 9;').content, 'const a = 1;\nconst b = 9;\nconst c = 3;\n');
+    assert.match(findMatch('x = 1\nx = 1\n', '1: x = 1').error, /matches 2 places/, 'the must-be-unique rule holds');
+    assert.equal(findMatch('see 12: done\n', '12: done').how, 'exact', 'text that really has the prefix matches as it is');
+    assert.match(findMatch(content, 'const b = 2;\n3: const c = 3;').error, /not found/, 'only when every line has a prefix');
+});
+
+test('findMatch: smart quotes, dashes and non-breaking spaces match their plain forms as a last resort', () => {
+    const content = "say('it’s fine') — ok\nx = 1\n";
+    assert.equal(findMatch(content, "say('it's fine') - ok").how, 'unicode-normalized');
+    assert.equal(findMatch(content, 'x = 1').how, 'whitespace-normalized', 'a non-breaking space is already whitespace');
+    assert.match(findMatch('a — b\na - b\n', 'a - b').how, /exact/, 'an exact match still wins');
+    assert.match(findMatch('a — b\nc\na – b\nc\n', 'a - b\nc').error, /matches 2 places \(unicode-normalized\)/);
+});
+
+test('missHint: an edit that already applied, or the closest lines with their numbers', () => {
+    const content = 'function f() {\n    const total = sum(items);\n    return total * 2;\n}\n';
+    assert.equal(missHint(content, 'return total;', '    const total = sum(items);\n    return total * 2;'),
+        'The replace text is already in the file, so this edit may already be applied.');
+    const hint = missHint(content, 'function f() {\n    const total = add(items);\n    return total * 2;\n}', 'x');
+    assert.equal(hint, 'The closest lines in the file:\n1: function f() {\n2:     const total = sum(items);\n3:     return total * 2;\n4: }');
+    assert.equal(missHint(content, 'nothing like it', 'y'), '', 'no hint when too few lines agree');
+    const res = replaceOnce(content, 'function f() {\n  return total * 2;', 'z');
+    assert.match(res.error, /^search text not found/);
+    assert.match(res.hint, /^The closest lines in the file:\n1: function f\(\) \{/);
+    assert.match(applyEdits(content, edit('function f() {\n  return total * 2;', 'z')).errors[0], /^edit 1: search text not found.*\nThe closest lines in the file:/);
 });
