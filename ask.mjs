@@ -8,6 +8,7 @@ import { makeCopy, inside, CantCopyError } from './workspace.mjs';
 import { availableParallelism } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
+import { backoffMs, errorBody, isTransientNetworkError, maxRetries, rateLimitWait, retryAfterMs, sleep } from './retry.mjs';
 
 const API_URL = `${API_BASE}/chat/completions`;
 export const MODELS = {
@@ -120,7 +121,11 @@ async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
         const raw = line.slice(5).trim();
         if (!raw || raw === '[DONE]') return;
         const chunk = JSON.parse(raw);
-        if (chunk.error) throw new ApiError(`WarriorGPT error mid-reply: ${JSON.stringify(chunk.error).slice(0, 500)}`);
+        if (chunk.error) {
+            throw Object.assign(new ApiError(`WarriorGPT error mid-reply: ${JSON.stringify(chunk.error).slice(0, 500)}`),
+                // The gateway's marker for a stream its upstream dropped: worth another try.
+                chunk.error.code === 'upstream_stream_incomplete' ? { retry: 'the stream was cut off (upstream_stream_incomplete)' } : {});
+        }
         const choice = chunk.choices?.[0];
         const thought = choice?.delta?.reasoning ?? choice?.delta?.reasoning_content;
         if (thought) {
@@ -168,6 +173,7 @@ async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
         pending = null;
         if (next.done) break;
         const part = next.value;
+        progress.bytes = (progress.bytes || 0) + part.length;
         buf += typeof part === 'string' ? part : decoder.decode(part, { stream: true });
         let i;
         while ((i = buf.indexOf('\n')) >= 0) {
@@ -182,7 +188,9 @@ async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
     }
     if (!stopped) take(buf.trim());
     // A stream that closes without a finish reason was cut short: its content is partial, so it is not a reply.
-    if (!stopped && !finish) throw new Error('the stream ended before the reply finished');
+    if (!stopped && (!finish || finish === 'incomplete')) {
+        throw Object.assign(new Error('the stream ended before the reply finished'), { retry: 'the stream was cut off before it finished' });
+    }
     return { usage, reasoningChars: reasoning, reasoningText, stopped,
         choices: [{ finish_reason: stopped ? 'think_budget' : finish,
             message: { content, ...(calls.length ? { tool_calls: calls.filter(Boolean) } : {}) } }] };
@@ -193,24 +201,56 @@ let inFlight = 0;
 
 // One request. thinkBudget (tokens, 0 = none) cuts the stream off once reasoning passes it with nothing written;
 // noThinking asks the server to skip thinking; signal aborts the request from outside (a parallel attempt that lost).
+// A 429, a connection that failed before any reply, or a stream cut short is sent again after a backoff (say logs
+// it).
 async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, tools, thinkBudget = 0, noThinking = false,
-    signal, wrap } = {}) {
+    signal, wrap, say } = {}) {
     const activeFile = join(STATE_DIR, `active-${SESSION}`);
     if (inFlight++ === 0) {
         mkdirSync(STATE_DIR, { recursive: true });
         writeFileSync(activeFile, '');
     }
-    const t0 = performance.now();
-    const times = {};
+    let t0 = performance.now();
+    let times = {};
     const mark = (what) => { times[what] ??= Math.round(performance.now() - t0); };
-    const cancel = new AbortController();
     const progress = { chars: 0 };
     // A request cancelled from outside still generated tokens: the error carries an estimate.
     const cancelled = () => Object.assign(new CancelledError('cancelled'), { usage: {
         in: Math.round(JSON.stringify(messages).length / CHARS_PER_TOKEN), out: Math.round(progress.chars / CHARS_PER_TOKEN),
         reasoning: 0, estimated: true } });
     let data;
+    const tries = maxRetries() + 1;
+    const started = Date.now();
     try {
+        for (let n = 1; ; n++) {
+            let wait;
+            t0 = performance.now();
+            times = {};
+            progress.bytes = 0;
+            try {
+                data = await chatOnce();
+                break;
+            } catch (err) {
+                if (!err.retry || n >= tries) {
+                    if (err.retry && n > 1) err.message += ` (gave up after ${n} tries in ${Math.round((Date.now() - started) / 1000)} s)`;
+                    throw err;
+                }
+                wait = Math.max(err.waitMs || 0, backoffMs(n));
+                const note = `--- WarriorGPT: ${err.retry}; retry ${n} of ${tries - 1} in ${(wait / 1000).toFixed(1)} s`;
+                say?.(note);
+                process.stderr.write(`warriorgpt: ${note.slice(4)}\n`);
+            }
+            try {
+                await sleep(wait, signal);
+            } catch {
+                throw cancelled();
+            }
+        }
+    } finally {
+        if (--inFlight === 0) rmSync(activeFile, { force: true });
+    }
+    async function chatOnce() {
+        const cancel = new AbortController();
         const send = (withSwitch) => fetch(API_URL, {
             method: 'POST',
             headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
@@ -233,21 +273,42 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
             }
         } catch (err) {
             if (signal?.aborted) throw cancelled();
-            throw new ApiError(`WarriorGPT unreachable: ${err.message}`);
+            const why = `${err.message}${err.cause?.code || err.cause?.message ? ` (${err.cause.code || err.cause.message})` : ''}`;
+            throw Object.assign(new ApiError(`WarriorGPT unreachable: ${why}`),
+                isTransientNetworkError(err) ? { retry: `unreachable: ${why}` } : {});
         }
         mark('headers');
-        if (!res.ok) throw new ApiError(`WarriorGPT ${res.status}: ${(await res.text()).slice(0, 500)}`);
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            if (res.status !== 429) throw new ApiError(`WarriorGPT ${res.status}: ${text.slice(0, 500)}`);
+            // Busy key: wait as long as the server says. A quota denial or a wait of minutes fails now, with its message.
+            const { message, code } = errorBody(text);
+            const after = retryAfterMs(res.headers?.get?.('retry-after'));
+            const waitMs = rateLimitWait(code, after);
+            throw Object.assign(new ApiError(`WarriorGPT 429${code ? ` (${code})` : ''}: ${message.slice(0, 500)}` +
+                `${after !== null ? ` [Retry-After ${Math.round(after / 100) / 10} s]` : ''}`),
+                waitMs === null ? {} : { retry: `429${code ? ` ${code}` : ''}: ${message.slice(0, 200)}`, waitMs });
+        }
+        let reply;
         try {
             const stopAt = thinkBudget > 0 ? (chars) => chars / CHARS_PER_TOKEN > thinkBudget : undefined;
-            data = (res.headers?.get?.('content-type') || '').includes('text/event-stream')
+            reply = (res.headers?.get?.('content-type') || '').includes('text/event-stream')
                 ? await readStream(res.body, { stopAt, mark, progress, wrap }) : await res.json();
         } catch (err) {
             if (signal?.aborted) throw cancelled();
-            throw err instanceof ApiError ? err : new ApiError(`WarriorGPT reply broke off: ${err.message}`);
+            // A connection that dropped before any byte of the reply is the same as one that never opened.
+            const retry = err.retry || (!progress.bytes && isTransientNetworkError(err) ? `the connection dropped before the reply: ${err.message}` : undefined);
+            const out = err instanceof ApiError ? err : new ApiError(`WarriorGPT reply broke off: ${err.message}`);
+            if (retry) out.retry = retry;
+            cancel.abort();
+            throw out;
         }
-        if (data.stopped) cancel.abort();
-    } finally {
-        if (--inFlight === 0) rmSync(activeFile, { force: true });
+        if (reply.choices?.[0]?.finish_reason === 'incomplete') {
+            throw Object.assign(new ApiError('WarriorGPT reply broke off: the stream ended before the reply finished (finish_reason incomplete)'),
+                { retry: 'the stream was cut off (finish_reason incomplete)' });
+        }
+        if (reply.stopped) cancel.abort();
+        return reply;
     }
     mark('end');
     const choice = data.choices?.[0];
@@ -588,7 +649,7 @@ export async function runAsk(args) {
         let reply;
         try {
             reply = await chat(key, { model, messages: msgs, maxTokens: room,
-                sampling: samplingFor(model, temperature), tools, noThinking: loopNoThinking(),
+                sampling: samplingFor(model, temperature), tools, noThinking: loopNoThinking(), say,
                 // deadline (the self-check's time limit) cancels the request in flight, not just the next one.
                 signal: deadline ? AbortSignal.any([AbortSignal.timeout(Math.max(1, deadline - Date.now())), ...(signal ? [signal] : [])]) : signal,
                 thinkBudget: fixed ? Math.min(fixed, room - 1024) : base && Math.min(state.base * budgetScale, Math.max(base, room - 1024)) });
@@ -642,7 +703,7 @@ export async function runAsk(args) {
                 // Budgeted on every try: an attempt that keeps thinking past it is dropped as a miss, since an unbudgeted try can stall the race.
                 // A reissue after a cut-off only has to write, so it gets the short budget; the wrap cuts one request, not the reissue after it.
                 reply = await chat(key, { model, messages: msgs, maxTokens: cap, attempt: 1, sampling,
-                    thinkBudget: free ? Math.min(budget, thinkBudget) : budget, noThinking: free > 0, signal,
+                    thinkBudget: free ? Math.min(budget, thinkBudget) : budget, noThinking: free > 0, signal, say: (t) => log(t.replace('--- ', `--- ${tag} `)),
                     wrap: wrap?.aborted ? undefined : wrap });
             } catch (err) {
                 if (!(err instanceof CancelledError)) throw err;
@@ -894,7 +955,7 @@ export async function runAsk(args) {
             // A cut-off or runaway reply is reissued at most MAX_FREE_RETRIES times with a budget; after that the
             // request runs to max_tokens, so the call always gets a real reply.
             const reply = await chat(key, { model, messages, maxTokens, attempt: check ? attempt : 0, sampling,
-                thinkBudget: free < MAX_FREE_RETRIES ? thinkBudget : 0, noThinking: free > 0 });
+                thinkBudget: free < MAX_FREE_RETRIES ? thinkBudget : 0, noThinking: free > 0, say: log });
             requests++;
             total.in += reply.usage.in;
             total.out += reply.usage.out;

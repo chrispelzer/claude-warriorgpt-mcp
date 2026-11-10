@@ -17,6 +17,7 @@
     "edits.mjs",
     "loop.mjs",
     "workspace.mjs",
+    "retry.mjs",
     "warriorgpt-ask.mjs",
     "warriorgpt-delegate.mjs",
     "common.mjs",

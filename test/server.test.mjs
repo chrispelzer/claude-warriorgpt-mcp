@@ -30,7 +30,7 @@ function rpc(lines, { reply = '', replies, finish, env = {}, mock = true } = {})
         // Keep the usage log out of the real home directory.
         env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home, WARRIORGPT_API_KEY: 'test-key',
             CLAUDE_CODE_SESSION_ID: 'test', MOCK_REPLY: replyFile, MOCK_FINISH: finish || '',
-            MOCK_REQUEST: join(dir, 'request.json'), ...env },
+            MOCK_REQUEST: join(dir, 'request.json'), WARRIORGPT_RETRY_BASE_MS: '1', ...env },
     });
     assert.equal(res.status, 0, res.stderr);
     return res.stdout.trim().split('\n').map((l) => JSON.parse(l));

@@ -23,7 +23,7 @@ function ask(args, { replies = [''], env = {} } = {}) {
         encoding: 'utf8',
         env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home, WARRIORGPT_API_KEY: 'test-key',
             CLAUDE_CODE_SESSION_ID: 'test', MOCK_REPLIES: join(dir, 'replies.json'),
-            MOCK_REQUEST: join(dir, 'request.json'), ...env },
+            MOCK_REQUEST: join(dir, 'request.json'), WARRIORGPT_RETRY_BASE_MS: '1', ...env },
     });
     const last = res.stdout.trim().split('\n').at(-1);
     return { code: res.status, out: res.stdout, err: res.stderr, json: last ? JSON.parse(last) : null };

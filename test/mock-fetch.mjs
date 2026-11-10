@@ -12,10 +12,16 @@
 // holds the streamed body back that long, and honours the request's abort signal.
 // MOCK_UNREACHABLE makes fetch throw, as a network failure does. MOCK_STREAM answers as an SSE stream;
 // MOCK_NO_FINISH ends that stream after the content, with no finish reason, as a dropped connection does.
+// MOCK_FAIL_FIRST (a JSON array) fails the first requests in turn, before any normal reply: "429" answers 429 with
+// Retry-After MOCK_RETRY_AFTER (default 0.2 s) and the gateway's concurrency message, "quota" a quota 429 with a
+// day-long Retry-After, "reset" throws as a reset connection does, "incomplete" streams half the reply and then
+// the gateway's upstream_stream_incomplete error event, with no finish reason.
+// MOCK_TIMES gets each request's Date.now() as a line.
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 
 let calls = 0;
 let requestsSeen = 0;
+let failures = 0;
 const routeCalls = {};
 
 // Windows briefly locks freshly created files (antivirus); racing lanes fire their requests together.
@@ -78,7 +84,26 @@ globalThis.fetch = async (url, init) => {
         if (requestsSeen++ === 0 || !existsSync(process.env.MOCK_REQUEST)) fsRetry(() => writeFileSync(process.env.MOCK_REQUEST, init.body));
         if (process.env.MOCK_REQUEST_LOG) fsRetry(() => appendFileSync(process.env.MOCK_REQUEST_LOG, init.body + '\n'));
     }
+    if (process.env.MOCK_TIMES) fsRetry(() => appendFileSync(process.env.MOCK_TIMES, `${Date.now()}\n`));
     if (process.env.MOCK_UNREACHABLE) throw new TypeError('fetch failed');
+    const failure = JSON.parse(process.env.MOCK_FAIL_FIRST || '[]')[failures++];
+    if (failure === 'reset') throw new TypeError('fetch failed', { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) });
+    if (failure === '429' || failure === 'quota') {
+        const body = failure === '429'
+            ? { error: { message: 'Too many concurrent requests for this API key (limit 6). Wait for one to finish and retry.',
+                type: 'rate_limit_exceeded', code: 'concurrency_limit_exceeded' } }
+            : { error: { message: 'You exceeded your current quota.', type: 'insufficient_quota', code: 'quota_exceeded' } };
+        const after = failure === '429' ? (process.env.MOCK_RETRY_AFTER || '0.2') : '86400';
+        return { ok: false, status: 429, headers: { get: (h) => (h.toLowerCase() === 'retry-after' ? after : null) },
+            text: async () => JSON.stringify(body) };
+    }
+    if (failure === 'incomplete') {
+        const enc = new TextEncoder();
+        const sse = `data: ${JSON.stringify({ choices: [{ delta: { content: 'half a rep' } }] })}\n\n` +
+            `data: ${JSON.stringify({ error: { message: 'The upstream model stream ended before it finished. Retry the request.',
+                type: 'server_error', code: 'upstream_stream_incomplete' } })}\n\n`;
+        return { ok: true, status: 200, headers: { get: () => 'text/event-stream' }, body: [enc.encode(sse)] };
+    }
     if (process.env.MOCK_REJECT_KWARGS && JSON.parse(init.body).chat_template_kwargs) {
         return { ok: false, status: 400, text: async () => '{"error":"unknown field: chat_template_kwargs"}' };
     }
