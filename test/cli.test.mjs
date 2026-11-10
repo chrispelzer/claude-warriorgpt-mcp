@@ -1,7 +1,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -177,4 +177,62 @@ test('a request over the context window stops at once with what to change, and l
         assert.match(r.err, /The request is over local\.qwen3\.8-27b's context window; attach fewer or smaller context_files, list fewer files, or split the task/);
         assert.equal(readFileSync(one, 'utf8'), 'start\n');
     }
+});
+
+test('a check whose program does not exist from cwd stops before anything is sent (exit 2)', () => {
+    const { one, prompt } = setup();
+    const log = join(dir, 'run.log');
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', '.venv/bin/python -m unittest', '--log', log], { replies: [block(one, edit('start', 'good'))] });
+    assert.equal(r.code, 2);
+    assert.match(r.err, /the check command could not run from .*: \.venv\/bin\/python not found; fix the check or pass cwd/);
+    assert.equal(existsSync(join(dir, 'request.json')), false, 'no request was sent');
+    assert.equal(readFileSync(one, 'utf8'), 'start\n');
+    assert.match(readFileSync(log, 'utf8'), /=== stopped: \.venv\/bin\/python not found/);
+});
+
+test('by default the check runs in the project root above the files, and the log says so', () => {
+    writeFileSync(join(dir, 'pyproject.toml'), '');
+    mkdirSync(join(dir, 'src', 'pkg'), { recursive: true });
+    const mod = join(dir, 'src', 'pkg', 'mod.txt');
+    writeFileSync(mod, 'start\n');
+    writeFileSync(join(dir, 'prompt.md'), 'Make mod.txt say good.');
+    writeFileSync(join(dir, 'check.mjs'), "import { readFileSync } from 'node:fs';\nconsole.log('ran in ' + process.cwd());\n" +
+        "if (!readFileSync('src/pkg/mod.txt', 'utf8').includes('good')) process.exit(1);\n");
+    const log = join(dir, 'run.log');
+    const r = ask(['--prompt-file', join(dir, 'prompt.md'), '--files', mod, '--check', `"${process.execPath}" check.mjs`, '--no-loop',
+        '--log', log], { replies: [block(mod, edit('start', 'good'))] });
+    assert.equal(r.code, 0, r.out + r.err);
+    const l = readFileSync(log, 'utf8');
+    assert.ok(l.split('\n')[0].endsWith(`| cwd: ${dir}`), l.split('\n')[0]);
+    assert.match(l, /\ncwd: the project root, the nearest folder above the files with pyproject\.toml\n/);
+});
+
+test('a check whose program cannot start stops every attempt at once (exit 2), files restored', { skip: process.platform === 'win32' && 'needs a POSIX shell' }, () => {
+    const { one, prompt } = setup();
+    writeFileSync(join(dir, 'run-tests'), '#!/bin/sh\nexit 0\n', { mode: 0o644 }); // not executable: the shell says 126
+    const log = join(dir, 'run.log');
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', './run-tests', '--cwd', dir, '--log', log],
+        { replies: [block(one, edit('start', 'good')), { tool_calls: [{ name: 'run_check', arguments: {} }] }],
+            env: { MOCK_REQUEST_LOG: join(dir, 'requests.jsonl') } });
+    assert.equal(r.code, 2, r.out + r.err);
+    assert.match(r.err, /the check command could not run from .*: .*run-tests: Permission denied; fix the check or pass cwd/);
+    assert.equal(readFileSync(one, 'utf8'), 'start\n');
+    assert.ok(readFileSync(join(dir, 'requests.jsonl'), 'utf8').trim().split('\n').length <= 3, 'stopped, not sent to fix it');
+    assert.match(readFileSync(log, 'utf8'), /!!! the check command could not run: .*Permission denied; stopping/);
+});
+
+test('in the tool loop, a check that stops being able to run is a setup problem, not a step to fix', { skip: process.platform === 'win32' && 'needs a POSIX shell' }, () => {
+    const { one, prompt } = setup();
+    // Runs once (a normal failure), then takes away its own exec bit.
+    writeFileSync(join(dir, 'run-tests'), '#!/bin/sh\nchmod -x "$0"\necho "1 test failed"\nexit 1\n', { mode: 0o755 });
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', './run-tests', '--cwd', dir, '--no-loop-lane'],
+        // The one-shot is checked in a copy; in the real tree the loop's first run is a normal failure, its second cannot start.
+        { replies: [block(one, edit('start', 'bad')), { tool_calls: [{ name: 'run_check', arguments: {} }] },
+            { tool_calls: [{ name: 'run_check', arguments: {} }] },
+            { tool_calls: [{ name: 'edit', arguments: { path: 'one.txt', search: 'bad', replace: 'good' } }] }],
+            env: { MOCK_REQUEST_LOG: join(dir, 'requests.jsonl') } });
+    assert.equal(r.code, 2, r.out + r.err);
+    assert.match(r.err, /could not run from .*Permission denied/);
+    assert.equal(readFileSync(join(dir, 'requests.jsonl'), 'utf8').trim().split('\n').length, 3, 'no step after the broken run');
+    assert.equal(readFileSync(one, 'utf8'), 'start\n', 'the one-shot edit was restored');
 });

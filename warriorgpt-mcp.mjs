@@ -65,7 +65,7 @@ const TOOL = {
                     'should pass. On failure the tool loop starts (or, with loop: false, the model retries with the ' +
                     'output); if it never passes, every listed file is restored. Runs locally like any command you run.',
             },
-            cwd: { type: 'string', description: 'Directory to run check in. Default: the common folder of files.' },
+            cwd: { type: 'string', description: 'Directory to run check in. Default: the project root, the nearest folder above files with .git, pyproject.toml, package.json, composer.json, go.mod, Cargo.toml, Makefile or a similar marker; else the server\'s current folder if it holds the files, else their common folder.' },
             loop: { type: 'boolean', description: 'With check: after a missed first attempt, switch to the tool loop (default true). false retries whole replies instead (max_attempts).' },
             parallel: { type: 'integer', description: 'With check: one-shot attempts sent at once, each checked in its own copy of the tree, raced by the loop lane from the start; the first to pass wins and the rest are cancelled (default 1, max 6).' },
             loop_lane: { type: 'boolean', description: 'With check: a tool-loop lane races the one-shot attempts from the start, in its own copy of the tree (default true). false: the one-shot attempts go first, then the loop starts from their best.' },

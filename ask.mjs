@@ -1,11 +1,11 @@
 // The ask_warriorgpt core, shared by the MCP server and the warriorgpt-ask CLI.
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
-import { dirname, resolve, join, sep } from 'node:path';
+import { dirname, resolve, join, sep, delimiter, isAbsolute } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
 import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow } from './loop.mjs';
 import { makeCopy, inside, CantCopyError, copyEnv, probeCopy, sameFailure } from './workspace.mjs';
-import { availableParallelism } from 'node:os';
+import { availableParallelism, homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
 import { requestSlot } from './limit.mjs';
@@ -561,6 +561,55 @@ function tail(text, n) {
     return text.length > n ? `[...${text.length - n} chars cut]\n${text.slice(-n)}` : text;
 }
 
+// The check's default folder: the nearest folder above the files with a project marker, never the home folder and
+// never above the current folder when the files are under it; else the current folder if it holds them, else
+// their common folder. Returns { dir, why }.
+const PROJECT_MARKERS = ['.git', 'pyproject.toml', 'setup.py', 'setup.cfg', 'package.json', 'composer.json', 'go.mod',
+    'Cargo.toml', 'Gemfile', 'pom.xml', 'build.gradle', 'Makefile'];
+export function defaultCwd(files, here = process.cwd(), home = homedir()) {
+    const common = commonDir(files);
+    const holds = (dir, path) => dir === path || inside(dir, path);
+    const underHere = holds(here, common);
+    for (let d = common; d !== home && (!underHere || holds(here, d)); d = dirname(d)) {
+        const marker = PROJECT_MARKERS.find((m) => existsSync(join(d, m)));
+        if (marker) return { dir: d, why: `the project root, the nearest folder above the files with ${marker}` };
+        if (d === dirname(d)) break;
+    }
+    if (underHere) return { dir: here, why: 'the current folder, which holds the files' };
+    return { dir: common, why: 'the common folder of the files' };
+}
+
+// The program a check command starts, or null when it starts with shell syntax or a builtin.
+const SHELL_WORDS = new Set(['cd', 'export', 'set', 'source', '.', 'exec', 'env', 'time', 'if', 'for', 'while', 'test', '[',
+    '!', '{', '(', 'case', 'until', 'eval', 'command', 'builtin', 'true', 'false', 'echo', 'exit']);
+export function checkProgram(command) {
+    const words = command.trim().match(/"[^"]*"|'[^']*'|\S+/g) || [];
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_]\w*=/.test(words[i])) i++;
+    const first = words[i]?.replace(/^["']|["']$/g, '');
+    if (!first || SHELL_WORDS.has(first) || /^[|&;<>()$`{]/.test(first)) return null;
+    return first.replace(/[;&|]+$/, '');
+}
+
+// Whether a check's program can be found from cwd: a path is looked up there, a bare name on PATH.
+export function programFound(program, cwd, env = process.env, platform = process.platform) {
+    if (/^node(\.exe)?$/i.test(program) || program === process.execPath) return true;
+    const exts = platform === 'win32' ? ['', ...(env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')] : [''];
+    const tryAt = (base) => exts.some((e) => existsSync(base + e));
+    if (/[/\\]/.test(program)) return tryAt(isAbsolute(program) ? program : resolve(cwd, program));
+    return (env.PATH || env.Path || '').split(delimiter).filter(Boolean).some((d) => tryAt(join(d, program)));
+}
+
+// A check run that failed because its own program could not start (126/127, not found), as opposed to tests failing.
+export function cannotRun(ran, program) {
+    if (ran.ok || ran.cancelled || ran.timedOut || !program) return '';
+    const name = program.split(/[/\\]/).pop();
+    const lines = ran.output.split('\n').map((l) => l.trim()).filter(Boolean);
+    const said = lines.find((l) => l.includes(name) && /command not found|No such file or directory|not found|ENOENT|Permission denied|is not recognized as an internal or external command|cannot execute/i.test(l));
+    if (said) return said;
+    return ran.code === 126 || ran.code === 127 ? (lines.find((l) => l.includes(name)) || '') : '';
+}
+
 function commonDir(paths) {
     const parts = paths.map((p) => dirname(p).split(sep));
     let n = parts[0].length;
@@ -636,8 +685,13 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     const loopLane = loop && args.loop_lane !== false && args.loop_lane !== 'false';
     const maxSteps = Math.min(Math.max(Number(args.max_steps) || DEFAULT_STEPS, 1), MAX_STEPS);
     const checkTimeout = Math.min(Math.max(Number(args.check_timeout_s) || 300, 1), 3600);
-    const cwd = args.cwd ? resolve(args.cwd) : files.length ? commonDir(files) : process.cwd();
+    const { dir: cwd, why: cwdWhy } = args.cwd ? { dir: resolve(args.cwd), why: 'as given' }
+        : files.length ? defaultCwd(files) : { dir: process.cwd(), why: 'the current folder' };
     if (check && !existsSync(cwd)) throw new UsageError(`cwd does not exist: ${cwd}`);
+    // A check that cannot even start would send the model off to fix the environment: stop before anything is sent.
+    const program = check ? checkProgram(check) : null;
+    const programIsTaskFile = program && files.includes(resolve(cwd, program));
+
     const model = args.model || DEFAULT_MODEL;
     const maxTokens = Number(args.max_tokens) || DEFAULT_MAX_TOKENS;
     const loopMaxTokens = Math.min(Number(args.loop_max_tokens) || DEFAULT_LOOP_MAX_TOKENS, maxTokens);
@@ -680,7 +734,11 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         withLockRetry(() => appendFileSync(logFile, text.endsWith('\n') ? text : `${text}\n`));
     };
     log(`=== warriorgpt-ask ${new Date().toISOString()} | ${model} | check: ${check || '(none)'} | cwd: ${cwd}\n` +
-        `files: ${files.join(', ') || '(none)'}`);
+        `files: ${files.join(', ') || '(none)'}\ncwd: ${cwdWhy}`);
+    if (program && !programIsTaskFile && !programFound(program, cwd)) {
+        log(`=== stopped: ${program} not found from ${cwd}; nothing was sent`);
+        throw new UsageError(`the check command could not run from ${cwd}: ${program} not found; fix the check or pass cwd.`);
+    }
 
     // Retries build on the files as the last attempt left them; a check that never passes restores the originals.
     const snapshot = new Map(files.map((f) => [f, existsSync(f) ? withLockRetry(() => readFileSync(f)) : null]));
@@ -705,8 +763,22 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     let lastFailure = '';
     // Every check run on the model's edits (not the confirming run in the real tree), and warnings for the result.
     const checkRuns = [];
+    // The first check run whose own program could not start stops the whole job (brokenStop cancels the race).
+    let brokenCheck = null;
+    const brokenStop = new AbortController();
     const noteCheck = (ran) => {
         if (!ran.cancelled) checkRuns.push(ran);
+        const line = !brokenCheck && !programIsTaskFile && cannotRun(ran, program);
+        if (line) {
+            brokenCheck = new UsageError(`the check command could not run from ${cwd}: ${line}; fix the check or pass cwd. ` +
+                'This is the check setup, not the code: nothing more was sent to the model.');
+            log(`!!! the check command could not run: ${line}; stopping`);
+            brokenStop.abort();
+        }
+        return ran;
+    };
+    const throwIfBroken = (ran) => {
+        if (brokenCheck) throw brokenCheck;
         return ran;
     };
     const warnings = [];
@@ -765,7 +837,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     // in it, so the user turn holds the tool instructions, the files as they are now and the lead.
     const loopRun = (mode, lead, steps, history = null) => runLoop({
         chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...contextPaths], cwd, mode,
-        runCheck: () => runCheck(check, cwd, checkTimeout, stop).then(noteCheck), runNode: (code) => runNode(code, cwd, stop, contextPaths), log,
+        runCheck: () => runCheck(check, cwd, checkTimeout, stop).then(noteCheck).then(throwIfBroken), runNode: (code) => runNode(code, cwd, stop, contextPaths), log,
         maxSteps: steps, maxTokens: mode === 'verify' ? LANE_MAX_TOKENS : loopMaxTokens, onRunaway: () => { runawaySeen = true; }, system: mode === 'verify' ? VERIFY_SYSTEM : FIX_SYSTEM,
         ...(history ? { history } : {}), verifyThink: VERIFY_THINK_BUDGET, verifyMs: verifyMs,
         user: history
@@ -973,6 +1045,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         };
         if (stop?.aborted) onStop();
         stop?.addEventListener('abort', onStop, { once: true });
+        brokenStop.signal.addEventListener('abort', onStop, { once: true });
         const lanePromise = loopLane ? runLane().then((r) => {
             if (r.contents && winner === null) {
                 winner = 'loop';
@@ -989,8 +1062,10 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         }))), lanePromise]);
         await probed;
         stop?.removeEventListener('abort', onStop);
+        brokenStop.signal.removeEventListener('abort', onStop);
         // Copies are removed in the background; nothing waits for it.
         copies.forEach((c) => c.then((x) => x.cleanup(), () => {}));
+        if (brokenCheck) throw brokenCheck;
         const errors = results.filter((r) => r.apiError);
         if (errors.length === results.length && (!lane || lane.error)) throw errors[0].apiError;
         return { results, winner: typeof winner === 'number' ? winner : null, laneWon: winner === 'loop', lane, temps };
@@ -1146,7 +1221,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             }
             if (!check) return done(summary, changedFiles());
 
-            const ran = noteCheck(await runCheck(check, cwd, checkTimeout, stop));
+            const ran = throwIfBroken(noteCheck(await runCheck(check, cwd, checkTimeout, stop)));
             stopped();
             log(`--- attempt ${attempt}: check ${ran.ok ? 'passed' : ran.timedOut ? 'timed out' : `failed (exit ${ran.code})`}\n${tail(ran.output, 20000)}`);
             if (ran.ok) {

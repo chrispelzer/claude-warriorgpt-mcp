@@ -13,7 +13,9 @@ const HELP = `Usage: warriorgpt-ask (--prompt-file <file> | --prompt <text>) [op
   --files <path>         a file the model may create or change (repeat, or comma-separate)
   --context <path>       a file attached as context (repeat, or comma-separate)
   --check <command>      with --files: run after the edits; retry with its output until it passes
-  --cwd <dir>            where --check runs (default: the common folder of --files)
+  --cwd <dir>            where --check runs (default: the project root, the nearest folder above --files with
+                         .git, pyproject.toml, package.json, composer.json, go.mod, Cargo.toml, Makefile or a
+                         similar marker; else the current folder if it holds the files, else their common folder)
   --parallel <n>         with --check: one-shot attempts at once, each checked in its own copy of the tree,
                          raced by the loop lane from the start; the first to pass wins (default 1, max 6)
   --no-loop-lane         with --check: no racing tool-loop lane; the one-shot attempts go first, then the
@@ -54,7 +56,8 @@ that tests the real tree instead of the copy, or one that fails the same way wha
 Jobs pass fastest when the acceptance tests are written first and passed as --check, and a big change is split
 into small tasks, each naming its --files and --context. Review the diff: a passing check is not a review. verified is false when the --verify self-check did not finish; the files still pass
 the check (self-check edits that broke it are undone).
-Exit codes: 0 done (check passed); 1 failed (a reply that could not be applied, no --check); 2 usage;
+Exit codes: 0 done (check passed); 1 failed (a reply that could not be applied, no --check); 2 usage, including a
+check whose program cannot run from --cwd;
 3 WarriorGPT unreachable or refused; 4 --check never passed, every file restored: hand the task to an agent
 that can run the code, such as OpenCode.`;
 
