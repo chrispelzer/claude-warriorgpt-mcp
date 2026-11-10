@@ -2,6 +2,7 @@
 // so it starts as a job and the caller polls it. Jobs live in this process; finished ones are kept for KEEP_MS.
 
 import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
 import { CancelledError } from './ask.mjs';
 
 export const DEFAULT_MAX_JOBS = 3;
@@ -16,8 +17,18 @@ const envMax = () => {
     return Number.isInteger(n) && n >= 1 ? n : DEFAULT_MAX_JOBS;
 };
 
-// Progress read from the run's log lines: replies from one-shot attempts, the latest tool-loop step, retries.
-function track(progress, line) {
+// The files a job may change. Two jobs that share one must not run together: a job that misses restores its
+// files from its own snapshot, which would wipe the other's edits. Case is folded where file systems usually do.
+const FOLD = process.platform === 'win32' || process.platform === 'darwin';
+export function filesOf(args) {
+    const paths = [...(Array.isArray(args?.files) ? args.files : []), ...(args?.output_file ? [args.output_file] : [])];
+    return new Set(paths.filter((p) => typeof p === 'string' && p).map((p) => (FOLD ? resolve(p).toLowerCase() : resolve(p))));
+}
+const overlaps = (a, b) => [...a].some((f) => b.has(f));
+
+// Progress read from the run's log lines: replies from one-shot attempts, the latest tool-loop step, retries (and
+// when the next one goes out).
+export function track(progress, line, now = Date.now()) {
     if (/--- (?:\[a\d+\] reply|attempt \d+(?: \(after [^)]*\))?: reply)/.test(line)) progress.replies++;
     const step = line.match(/(fix|verify) step (\d+) of (\d+)/);
     if (step) {
@@ -25,7 +36,12 @@ function track(progress, line) {
         const lane = line.includes('[loop]') ? 'loop lane ' : '';
         progress.step = `${lane}${mode} step ${n} of ${of}`;
     }
-    if (/WarriorGPT: .*; retry \d+ of \d+/.test(line)) progress.retries++;
+    const retry = line.match(/WarriorGPT: (.*); retry (\d+) of (\d+) in ([\d.]+) s/);
+    if (retry) {
+        progress.retries++;
+        progress.next_retry = { attempt: Number(retry[2]), of: Number(retry[3]), reason: retry[1].slice(0, 200),
+            at: new Date(now + Number(retry[4]) * 1000).toISOString() };
+    }
     const phase = line.match(/^=== (.{0,120})/);
     if (phase) progress.phase = phase[1];
 }
@@ -34,6 +50,7 @@ function track(progress, line) {
 export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now = Date.now } = {}) {
     const jobs = new Map();
     const waiting = [];
+    const live = new Set();
     let running = 0;
 
     const prune = () => {
@@ -63,11 +80,27 @@ export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now =
                 (error) => settle(job, error instanceof CancelledError || job.ctl.signal.aborted ? 'cancelled' : 'failed', { error }))
             .finally(() => {
                 running--;
-                while (waiting.length && running < maxRunning) {
-                    const next = waiting.shift();
-                    if (next.state === 'queued') begin(next);
-                }
+                live.delete(job);
+                pump();
             });
+    };
+    // Starts waiting jobs in order while there is room, skipping any that shares a file with a running job or with
+    // an earlier waiting one (so jobs on the same files run in the order they came).
+    const pump = () => {
+        const claimed = [...live].map((j) => j.files);
+        for (const job of [...waiting]) {
+            const blocker = [...live].find((j) => overlaps(j.files, job.files))
+                || waiting.slice(0, waiting.indexOf(job)).find((j) => overlaps(j.files, job.files));
+            if (running < maxRunning && !blocker && !claimed.some((f) => overlaps(f, job.files))) {
+                waiting.splice(waiting.indexOf(job), 1);
+                job.blockedBy = null;
+                live.add(job);
+                begin(job);
+            } else {
+                job.blockedBy = blocker?.id || null;
+            }
+            claimed.push(job.files);
+        }
     };
 
     function start(args) {
@@ -76,11 +109,11 @@ export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now =
             throw new Error(`${running} jobs running and ${waiting.length} waiting; wait for some to finish or cancel them.`);
         }
         const id = `wgpt-${randomBytes(4).toString('hex')}`;
-        const job = { id, args, state: 'queued', created: now(), started: null, finished: null, ctl: new AbortController(),
-            log: [], waiters: [], progress: { replies: 0, step: null, retries: 0, phase: null } };
+        const job = { id, args, files: filesOf(args), blockedBy: null, state: 'queued', created: now(), started: null, finished: null,
+            ctl: new AbortController(), log: [], waiters: [], progress: { replies: 0, step: null, retries: 0, phase: null, next_retry: null } };
         jobs.set(id, job);
-        if (running < maxRunning) begin(job);
-        else waiting.push(job);
+        waiting.push(job);
+        pump();
         return job;
     }
 
@@ -108,6 +141,7 @@ export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now =
         if (job.state === 'queued') {
             waiting.splice(waiting.indexOf(job), 1);
             settle(job, 'cancelled', { error: new CancelledError('cancelled before it started') });
+            pump();
         } else {
             job.state = 'cancelling';
         }
@@ -117,7 +151,12 @@ export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now =
         prune();
         return [...jobs.values()];
     };
-    const cancelAll = () => list().forEach(cancel);
+    // Cancels every job and resolves once the running ones have unwound (their files restored).
+    const cancelAll = () => {
+        const all = list();
+        all.forEach(cancel);
+        return Promise.allSettled(all.map((j) => j.promise).filter(Boolean)).then(() => {});
+    };
 
     const elapsedMs = (job) => (job.finished || now()) - (job.started || job.created);
     return { start, get, wait, cancel, cancelAll, list, elapsedMs, stats: () => ({ running, waiting: waiting.length, maxRunning }) };

@@ -796,3 +796,10 @@ test('runLoop: the verify time limit cancels a request still in flight; other er
     ctx2.chat = async () => { throw new Error('boom'); };
     await assert.rejects(runLoop(ctx2), /boom/);
 });
+
+test('runLoop: a call to a tool that does not exist is told which tools do', async () => {
+    const { ctx, seen } = fakeCtx([{ calls: [['grep', { pattern: 'x' }]] }], { maxSteps: 2 });
+    await runLoop(ctx);
+    const result = seen[1].find((m) => m.role === 'tool').content;
+    assert.match(result, /there is no tool named grep; the tools are read_file, edit, run_check, run_node, done/);
+});

@@ -365,7 +365,7 @@ export async function runLoop(ctx) {
                 return `error: the arguments are not valid JSON (${err.message}). Send the call again${reply.finish === 'length' ? ', shorter: the reply was cut off' : ''}.`;
             }
             const fn = tools[call.name];
-            if (!fn) return `error: there is no tool named ${call.name}`;
+            if (!fn) return `error: there is no tool named ${call.name}; the tools are ${Object.keys(tools).join(', ')}`;
             const t0 = performance.now();
             const result = await fn(args);
             took.set(call, Math.round(performance.now() - t0));

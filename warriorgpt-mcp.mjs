@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
 import { DEFAULT_MODEL } from './common.mjs';
 import { MODELS, runAsk, UsageError } from './ask.mjs';
-import { createJobs } from './jobs.mjs';
+import { createJobs, track } from './jobs.mjs';
 import { setMaxConcurrency } from './limit.mjs';
 
 const TOOL = {
@@ -157,22 +157,28 @@ const findJob = (args) => {
     return job;
 };
 
+// The next request retry, while it is still ahead.
+const nextRetry = (p) => (p.next_retry && Date.parse(p.next_retry.at) > Date.now() ? p.next_retry : null);
 function progressText(p) {
+    const r = nextRetry(p);
     return [p.replies && `${p.replies} one-shot repl${p.replies === 1 ? 'y' : 'ies'}`, p.step,
-        p.retries && `${p.retries} request retr${p.retries === 1 ? 'y' : 'ies'}`].filter(Boolean).join(', ') || 'starting';
+        p.retries && `${p.retries} request retr${p.retries === 1 ? 'y' : 'ies'}`,
+        r && `retry ${r.attempt} of ${r.of} at ${r.at} (${r.reason})`].filter(Boolean).join(', ') || 'starting';
 }
 function statusOf(job, logLines = 15) {
     const tail = logLines > 0 ? job.log.slice(-logLines) : [];
     const task = String(job.args.prompt || '').replace(/\s+/g, ' ').slice(0, 100);
     const poll = nextPoll(job);
-    const text = [`job ${job.id}: ${job.state}, ${clock(jobs.elapsedMs(job))}${job.state === 'queued' ? ' waiting' : ''}`,
+    const text = [`job ${job.id}: ${job.state}, ${clock(jobs.elapsedMs(job))}${job.state === 'queued' ? ' waiting' : ''}` +
+        `${job.state === 'queued' && job.blockedBy ? ` for ${job.blockedBy}, which may change the same files` : ''}`,
         `progress: ${progressText(job.progress)}`,
         `task: ${task}${job.args.check ? ` | check: ${job.args.check}` : ''}`,
         ...(tail.length ? ['last log lines:', ...tail.map((l) => `  ${l}`)] : []),
         FINISHED.has(job.state) ? 'Finished: call get_warriorgpt_job_result for the outcome.'
             : `Still going: check again in about ${poll} s.`].join('\n');
     return { text, structured: { job_id: job.id, state: job.state, elapsed_s: seconds(jobs.elapsedMs(job)),
-        progress: { ...job.progress }, ...(poll ? { next_poll_s: poll } : {}), log_tail: tail } };
+        progress: { ...job.progress, next_retry: nextRetry(job.progress) }, ...(job.blockedBy && job.state === 'queued' ? { waiting_for: job.blockedBy } : {}),
+        ...(poll ? { next_poll_s: poll } : {}), log_tail: tail } };
 }
 
 async function callJobTool(name, args) {
@@ -218,6 +224,33 @@ async function callJobTool(name, args) {
     return { content: [{ type: 'text', text }], structuredContent: structured };
 }
 
+// A plain ask_warriorgpt run, cancellable like a job when the server is told to stop.
+const asks = new Set();
+async function ask(args, progressToken) {
+    const ctl = new AbortController();
+    const progress = { replies: 0, step: null, retries: 0, phase: null, next_retry: null };
+    let n = 0;
+    let last = '';
+    // With a progressToken, every step, reply or retry becomes a notifications/progress message.
+    const onLog = progressToken === undefined ? undefined : (text) => {
+        for (const line of String(text).split('\n')) track(progress, line.trimEnd());
+        const now = progressText(progress);
+        if (now === last) return;
+        last = now;
+        send({ method: 'notifications/progress', params: { progressToken, progress: ++n, message: now } });
+    };
+    const run = runAsk(args, { signal: ctl.signal, onLog });
+    const entry = { ctl, done: run.catch(() => {}) };
+    asks.add(entry);
+    try {
+        return await run;
+    } finally {
+        asks.delete(entry);
+    }
+}
+
+const TOOL_NAMES = () => [TOOL, ...JOB_TOOLS].map((t) => t.name).join(', ');
+
 function send(msg) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
 }
@@ -238,12 +271,14 @@ async function handle(req) {
         case 'tools/call':
             if (params?.name === TOOL.name) {
                 try {
-                    return send({ id, result: toolResult(await runAsk(params.arguments || {})) });
+                    return send({ id, result: toolResult(await ask(params.arguments || {}, params?._meta?.progressToken)) });
                 } catch (err) {
                     return send({ id, result: errorResult(err) });
                 }
             }
-            if (!JOB_TOOLS.some((t) => t.name === params?.name)) return send({ id, error: { code: -32602, message: `Unknown tool ${params?.name}` } });
+            if (!JOB_TOOLS.some((t) => t.name === params?.name)) {
+                return send({ id, error: { code: -32602, message: `Unknown tool ${params?.name}; the tools are ${TOOL_NAMES()}` } });
+            }
             try {
                 return send({ id, result: await callJobTool(params.name, params.arguments) });
             } catch (err) {
@@ -265,6 +300,20 @@ try {
 
 // The client is gone: nobody can read a job's result, so its runs stop and put the files back. A plain
 // ask_warriorgpt call still in flight finishes as before.
+// SIGTERM or SIGINT stops every run, job or plain call, and exits once their files are restored (at most 10 s).
+let stopping = false;
+const stopAll = async (code) => {
+    if (stopping) return;
+    stopping = true;
+    for (const a of asks) a.ctl.abort();
+    const guard = setTimeout(() => process.exit(code), 10_000);
+    await Promise.all([jobs.cancelAll(), ...[...asks].map((a) => a.done)]);
+    clearTimeout(guard);
+    process.exit(code);
+};
+process.on('SIGTERM', () => stopAll(143));
+process.on('SIGINT', () => stopAll(130));
+
 createInterface({ input: process.stdin }).on('close', () => jobs.cancelAll()).on('line', (line) => {
     if (!line.trim()) return;
     let req;
