@@ -6,6 +6,7 @@
 import { parseArgs } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { ApiError, UsageError, runAsk } from './ask.mjs';
+import { setMaxConcurrency } from './limit.mjs';
 
 const HELP = `Usage: warriorgpt-ask (--prompt-file <file> | --prompt <text>) [options]
 
@@ -36,6 +37,8 @@ const HELP = `Usage: warriorgpt-ask (--prompt-file <file> | --prompt <text>) [op
                          penalty for Qwen models; the server's own for others)
   --retry-temperature-step <t>  added per retry, capped at 0.8 (default 0.1; 0 keeps it flat)
   --log <file>           append every reply and check output to this file
+  --max-concurrency <n>  WarriorGPT requests in flight at once, shared with every other warriorgpt-ask and
+                         warriorgpt-mcp on this machine (default 6 or WARRIORGPT_MAX_CONCURRENCY; 0 = no limit)
   --json                 print only the final JSON line
 
 With --check, the first attempt is one request with every file attached. If its check fails, the model gets
@@ -80,6 +83,7 @@ async function main() {
                 temperature: { type: 'string' },
                 'retry-temperature-step': { type: 'string' },
                 log: { type: 'string' },
+                'max-concurrency': { type: 'string' },
                 json: { type: 'boolean' },
                 help: { type: 'boolean', short: 'h' },
             },
@@ -100,6 +104,13 @@ async function main() {
     };
     const prompt = opts['prompt-file'] ? read(opts['prompt-file'], '--prompt-file') : opts.prompt;
     if (!prompt) throw new UsageError('--prompt-file or --prompt is required (see --help).');
+    if (opts['max-concurrency'] !== undefined) {
+        try {
+            setMaxConcurrency(opts['max-concurrency']);
+        } catch (err) {
+            throw new UsageError(`--max-concurrency: ${err.message}`);
+        }
+    }
 
     const started = Date.now();
     const res = await runAsk({

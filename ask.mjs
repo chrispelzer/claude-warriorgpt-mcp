@@ -8,6 +8,7 @@ import { makeCopy, inside, CantCopyError } from './workspace.mjs';
 import { availableParallelism } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
+import { requestSlot } from './limit.mjs';
 import { backoffMs, errorBody, isTransientNetworkError, maxRetries, rateLimitWait, retryAfterMs, sleep } from './retry.mjs';
 
 const API_URL = `${API_BASE}/chat/completions`;
@@ -202,7 +203,7 @@ let inFlight = 0;
 // One request. thinkBudget (tokens, 0 = none) cuts the stream off once reasoning passes it with nothing written;
 // noThinking asks the server to skip thinking; signal aborts the request from outside (a parallel attempt that lost).
 // A 429, a connection that failed before any reply, or a stream cut short is sent again after a backoff (say logs
-// it).
+// it); each try holds one slot of the shared request limit while it runs.
 async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, tools, thinkBudget = 0, noThinking = false,
     signal, wrap, say } = {}) {
     const activeFile = join(STATE_DIR, `active-${SESSION}`);
@@ -223,7 +224,13 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
     const started = Date.now();
     try {
         for (let n = 1; ; n++) {
-            let wait;
+            let release, wait;
+            try {
+                release = await requestSlot(key, signal);
+            } catch (err) {
+                if (signal?.aborted) throw cancelled();
+                throw err;
+            }
             t0 = performance.now();
             times = {};
             progress.bytes = 0;
@@ -239,6 +246,8 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
                 const note = `--- WarriorGPT: ${err.retry}; retry ${n} of ${tries - 1} in ${(wait / 1000).toFixed(1)} s`;
                 say?.(note);
                 process.stderr.write(`warriorgpt: ${note.slice(4)}\n`);
+            } finally {
+                release();
             }
             try {
                 await sleep(wait, signal);

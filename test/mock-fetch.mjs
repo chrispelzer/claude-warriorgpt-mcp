@@ -16,12 +16,15 @@
 // Retry-After MOCK_RETRY_AFTER (default 0.2 s) and the gateway's concurrency message, "quota" a quota 429 with a
 // day-long Retry-After, "reset" throws as a reset connection does, "incomplete" streams half the reply and then
 // the gateway's upstream_stream_incomplete error event, with no finish reason.
-// MOCK_TIMES gets each request's Date.now() as a line.
+// MOCK_TIMES gets each request's Date.now() as a line. MOCK_IN_FLIGHT gets the most requests open at once (a
+// request is open until its body is read to the end or aborted).
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 
 let calls = 0;
 let requestsSeen = 0;
 let failures = 0;
+let open = 0;
+let mostOpen = 0;
 const routeCalls = {};
 
 // Windows briefly locks freshly created files (antivirus); racing lanes fire their requests together.
@@ -104,6 +107,10 @@ globalThis.fetch = async (url, init) => {
                 type: 'server_error', code: 'upstream_stream_incomplete' } })}\n\n`;
         return { ok: true, status: 200, headers: { get: () => 'text/event-stream' }, body: [enc.encode(sse)] };
     }
+    if (process.env.MOCK_IN_FLIGHT) {
+        mostOpen = Math.max(mostOpen, ++open);
+        fsRetry(() => writeFileSync(process.env.MOCK_IN_FLIGHT, String(mostOpen)));
+    }
     if (process.env.MOCK_REJECT_KWARGS && JSON.parse(init.body).chat_template_kwargs) {
         return { ok: false, status: 400, text: async () => '{"error":"unknown field: chat_template_kwargs"}' };
     }
@@ -142,7 +149,15 @@ globalThis.fetch = async (url, init) => {
             });
             for (const p of parts.slice(1)) yield p;
         })();
-        return { ok: true, status, headers: { get: () => 'text/event-stream' }, body };
+        if (!process.env.MOCK_IN_FLIGHT) return { ok: true, status, headers: { get: () => 'text/event-stream' }, body };
+        const counted = (async function* () {
+            try {
+                for await (const p of body) yield p;
+            } finally {
+                open--;
+            }
+        })();
+        return { ok: true, status, headers: { get: () => 'text/event-stream' }, body: counted };
     }
     return {
         ok: status < 400,
