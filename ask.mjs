@@ -3,7 +3,7 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
 import { dirname, resolve, join, sep } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
-import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS } from './loop.mjs';
+import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow } from './loop.mjs';
 import { makeCopy, inside, CantCopyError, copyEnv, probeCopy, sameFailure } from './workspace.mjs';
 import { availableParallelism } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -69,7 +69,6 @@ const MAX_FREE_RETRIES = 2;
 export const FALLBACK_HINT = 'fallback: opencode. Hand this task to an agent that can run the tests and read the code ' +
     '(for example warriorgpt-delegate, or your OpenCode subagent).';
 export const MAX_TEMPERATURE = 0.8;
-const CHECK_OUTPUT_CHARS = 4000;
 // The loop lane is the main path on hard tasks; OpenCode has no step cap, and lower caps made lanes give up too early.
 const DEFAULT_STEPS = 30;
 const MAX_STEPS = 40;
@@ -593,6 +592,9 @@ export async function runAsk(args) {
         log(`!!! WARNING: ${text}`);
     };
     const contextPaths = (args.context_files || []).map((p) => resolve(p));
+    // A one-shot request over the context window will not fit on a retry either: stop with what to change.
+    const tooBig = (err) => (isContextOverflow(err) ? new UsageError(`The request is over ${model}'s context window; attach ` +
+        `fewer or smaller context_files, list fewer files, or split the task. (${err.message.slice(0, 300)})`) : err);
 
     const changedFiles = () => {
         const changed = [];
@@ -678,7 +680,7 @@ export async function runAsk(args) {
                     thinkBudget: budgetOf(free), noThinking: free > 0, signal,
                     wrap: wrap?.aborted ? undefined : wrap });
             } catch (err) {
-                if (!(err instanceof CancelledError)) throw err;
+                if (!(err instanceof CancelledError)) throw tooBig(err);
                 if (err.usage) countReply({ usage: err.usage });
                 log(`--- ${tag} cancelled: another attempt passed${err.usage ? ` (~${err.usage.out} tokens generated)` : ''}`);
                 return { cancelled: true };
@@ -893,7 +895,7 @@ export async function runAsk(args) {
                 passed = { attempts: attemptsMade, loop: true, head: `check passed in the tool loop at step ${fixSteps} of ${maxSteps}, ` +
                     `racing ${attemptsMade} one-shot attempt${attemptsMade === 1 ? '' : 's'} from the start: ${check}${res.summary ? `\n${res.summary}` : ''}` };
             } else {
-                lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${tail(ran.output, CHECK_OUTPUT_CHARS)}`;
+                lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${headTail(ran.output)}`;
             }
         } else if (raced) {
             attemptsMade = raced.results.length;
@@ -925,14 +927,14 @@ export async function runAsk(args) {
                     passed = { attempts: attemptsMade, loop: false, head: `check passed on parallel attempt ${won.i + 1} of ` +
                         `${attemptsMade} (temperature ${won.temp}): ${check}\n${won.summary}` };
                 } else {
-                    lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${tail(ran.output, CHECK_OUTPUT_CHARS)}`;
+                    lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${headTail(ran.output)}`;
                 }
             } else if (best?.ran) {
                 const why = best.ran.timedOut ? `timed out after ${checkTimeout}s` : `failed (exit ${best.ran.code})`;
                 log(laneDone
                     ? `=== no parallel attempt passed and the loop lane is out of steps; [a${best.i + 1}] was closest (${best.score < 1e6 ? `${best.score} failing` : 'failing'})`
                     : `=== no parallel attempt passed; the loop starts from [a${best.i + 1}] (${best.score < 1e6 ? `${best.score} failing` : 'failing'})`);
-                lastFailure = `check ${why}:\n${tail(best.ran.output, CHECK_OUTPUT_CHARS)}`;
+                lastFailure = `check ${why}:\n${headTail(best.ran.output)}`;
             } else {
                 lastFailure = best?.error || 'no attempt produced a usable reply';
             }
@@ -945,7 +947,7 @@ export async function runAsk(args) {
             // always gets a real reply.
             const tryBudget = free < MAX_FREE_RETRIES ? budgetAt(free) : 0;
             const reply = await chat(key, { model, messages, maxTokens: free && tryBudget ? Math.max(maxTokens, Math.min(tryBudget + WRITE_ROOM, RACE_MAX_TOKENS)) : maxTokens,
-                attempt: check ? attempt : 0, sampling, thinkBudget: tryBudget, noThinking: free > 0 });
+                attempt: check ? attempt : 0, sampling, thinkBudget: tryBudget, noThinking: free > 0 }).catch((err) => { throw tooBig(err); });
             requests++;
             total.in += reply.usage.in;
             total.out += reply.usage.out;
@@ -1014,7 +1016,7 @@ export async function runAsk(args) {
                 break;
             }
             const why = ran.timedOut ? `timed out after ${checkTimeout}s` : `failed (exit ${ran.code})`;
-            const output = tail(ran.output, CHECK_OUTPUT_CHARS);
+            const output = headTail(ran.output);
             lastFailure = `check ${why}:\n${output}`;
             retry(reply.text, `Your edits were written and \`${check}\` ${why}. Output:\n\`\`\`\n${output}\n\`\`\``);
         }
@@ -1022,7 +1024,7 @@ export async function runAsk(args) {
         if (!passed && laneDone && !raced.laneWon) {
             // The loop lane already ran its steps alongside the attempts: no second loop.
             const lane = raced.lane;
-            if (lane.res?.lastOutput) lastFailure = `check ${tail(lane.res.lastOutput, CHECK_OUTPUT_CHARS)}`;
+            if (lane.res?.lastOutput) lastFailure = `check ${headTail(lane.res.lastOutput)}`;
             else if (lane.error) lastFailure = `${lastFailure ? `${lastFailure}\n` : ''}the loop lane stopped: ${lane.error.message}`;
             if (lane.res && lane.res.steps >= maxSteps) outOfSteps = true;
             log('=== no lane passed: neither the one-shot attempts nor the loop lane');
@@ -1037,7 +1039,7 @@ export async function runAsk(args) {
                     `(${attemptsMade > 1 ? `${attemptsMade} parallel attempts` : 'attempt 1'} missed): ${check}${res.summary ? `\n${res.summary}` : ''}` };
             } else {
                 // The loop's own last check run, if it ran one; otherwise the one-shot failure still stands.
-                if (res.lastOutput) lastFailure = `check ${tail(res.lastOutput, CHECK_OUTPUT_CHARS)}`;
+                if (res.lastOutput) lastFailure = `check ${headTail(res.lastOutput)}`;
                 if (res.steps >= maxSteps) outOfSteps = true;
             }
         }

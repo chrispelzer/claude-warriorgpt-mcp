@@ -4,11 +4,11 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, SELF_CHECK_PROMPT } from '../loop.mjs';
+import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, SELF_CHECK_PROMPT, headTail } from '../loop.mjs';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const SERVER = resolve(here, '../warriorgpt-mcp.mjs');
@@ -815,4 +815,75 @@ test('runLoop: a snippet the sandbox stopped gets the rules with its output; the
     assert.doesNotMatch(results[1], /sandboxed/, 'a snippet that ran fine gets no hint');
     const refused = seen[2].filter((m) => m.role === 'tool').at(-1).content;
     assert.match(refused, /^error: helper\.txt is not a file you may change; it is read-only\. Allowed: .*f\.txt\. Put the change in one of those files instead\./);
+});
+
+test('headTail keeps the start and the end, cut at line ends', () => {
+    const text = Array.from({ length: 400 }, (_, i) => `line ${i}`).join('\n');
+    const out = headTail(text, 100, 200);
+    assert.match(out, /^line 0\nline 1\n/);
+    assert.match(out, /\n\[\.\.\.\d+ chars cut\.\.\.\]\n/);
+    assert.match(out, /line 399$/);
+    assert.ok(out.split('\n').every((l) => /^line \d+$|^\[\.\.\./.test(l)), 'no line is cut in half');
+    assert.equal(headTail('short'), 'short');
+});
+
+test('runLoop: long check output shows its head and tail, and the full output can be read until the loop ends', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, 'a\n');
+    const output = `Traceback (most recent call last):\n  FIRST ERROR HERE\n${'noise\n'.repeat(2000)}1 failed in 0.1s`;
+    let saved;
+    const { ctx, seen } = fakeCtx([
+        { calls: [['run_check']] },
+        { calls: [['read_file', { path: '__SAVED__', offset: 1, limit: 2 }]] },
+        { calls: [['done', { summary: 'x' }]] },
+    ], { files: [f], maxSteps: 3, runCheck: async () => ({ ok: false, code: 1, output }) });
+    const chat = ctx.chat;
+    ctx.chat = async (messages, opts) => {
+        const last = messages.at(-1);
+        if (last.role === 'tool' && !saved) saved = last.content.match(/\[full output: (.+), (\d+) lines; read_file it with offset\]$/)?.[1];
+        const reply = await chat(messages, opts);
+        for (const c of reply.toolCalls) c.arguments = c.arguments.replace('__SAVED__', JSON.stringify(saved || '').slice(1, -1));
+        return reply;
+    };
+    await runLoop(ctx);
+    const first = seen[1].filter((m) => m.role === 'tool').at(-1).content;
+    assert.match(first, /^FAILED \(exit 1\)\nTraceback \(most recent call last\):\n {2}FIRST ERROR HERE\n/, 'the first traceback is kept');
+    assert.match(first, /1 failed in 0\.1s\n\[full output: .*output-1\.txt, 2004 lines; read_file it with offset\]$/);
+    assert.ok(first.length < 4400);
+    const read = seen[2].filter((m) => m.role === 'tool').at(-1).content;
+    assert.match(read, /^1: FAILED \(exit 1\)\n2: Traceback/, 'read_file may open the saved output');
+    assert.equal(existsSync(saved), false, 'the saved output is removed when the loop ends');
+});
+
+test('runLoop: a request over the context window is retried once with the history cut hard, then fails clearly', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, 'a\n');
+    const overflow = new Error('WarriorGPT 400: {"error":{"code":"context_length_exceeded","message":"too long"}}');
+    const sent = [];
+    let n = 0;
+    const replies = [
+        { toolCalls: [{ id: 'c1', name: 'run_node', arguments: '{"code":"1"}' }], reasoningText: 'long thoughts' },
+        { toolCalls: [{ id: 'c2', name: 'run_node', arguments: '{"code":"2"}' }], reasoningText: 'more thoughts' },
+        'overflow',
+        { toolCalls: [{ id: 'c3', name: 'done', arguments: '{"summary":"ok"}' }] },
+    ];
+    const { ctx } = fakeCtx([], { files: [f], maxSteps: 5, runCheck: async () => ({ ok: true, code: 0, output: 'ok' }),
+        runNode: async () => ({ ok: true, code: 0, output: 'r'.repeat(1000) }) });
+    ctx.chat = async (messages) => {
+        sent.push(structuredClone(messages));
+        const r = replies[n++];
+        if (r === 'overflow') throw overflow;
+        return { text: '', finish: 'tool_calls', usage: { in: 1, out: 1, reasoning: 0 }, reasoningText: r.reasoningText || '', toolCalls: r.toolCalls };
+    };
+    const res = await runLoop(ctx);
+    assert.equal(res.passed, true);
+    const retried = sent[3];
+    assert.ok(!retried.some((m) => m.reasoning_content), 'every reasoning_content is dropped');
+    const toolResults = retried.filter((m) => m.role === 'tool').map((m) => m.content);
+    assert.match(toolResults[0], /older output trimmed/);
+    assert.equal(toolResults.at(-1), `exit 0\n${'r'.repeat(1000)}`, 'the latest tool result stays whole');
+
+    n = 0;
+    replies.splice(0, replies.length, 'overflow', 'overflow');
+    await assert.rejects(runLoop(ctx), /over the model's context window even after trimming its history; split the task, or attach fewer or smaller context_files/);
 });

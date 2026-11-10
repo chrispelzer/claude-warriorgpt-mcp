@@ -167,3 +167,14 @@ test('a check that times out says how to give it longer', () => {
     assert.match(r.out, /note: the check timed out after 1 s; check_timeout_s \(--check-timeout\) raises it, up to 3600\./);
     assert.equal(r.json.warnings, undefined, 'one run is not a pattern');
 });
+
+test('a request over the context window stops at once with what to change, and leaves the files alone', () => {
+    const { one, prompt, check } = setup();
+    const env = { MOCK_STATUS: '400', MOCK_ERROR_BODY: '{"error":{"code":"context_length_exceeded","message":"too many tokens"}}' };
+    for (const extra of [[], ['--no-loop']]) {
+        const r = ask(['--prompt-file', prompt, '--files', one, '--check', check, ...extra], { env });
+        assert.equal(r.code, 2, r.err);
+        assert.match(r.err, /The request is over local\.qwen3\.8-27b's context window; attach fewer or smaller context_files, list fewer files, or split the task/);
+        assert.equal(readFileSync(one, 'utf8'), 'start\n');
+    }
+});
