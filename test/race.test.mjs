@@ -2,9 +2,9 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname, delimiter } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { FIX_SYSTEM, SELF_CHECK_PROMPT } from '../loop.mjs';
 import { failCount } from '../ask.mjs';
@@ -259,4 +259,65 @@ test('race: a runaway attempt is dropped, with no runaway retries inside the rac
     // The lane's requests carry a 16384 cap too; tell them apart by their tools.
     assert.equal(requests().filter((r) => !r.tools && r.max_tokens !== 32768).length, 2, 'no retries for a1 or a2');
     assert.equal(readFileSync(one, 'utf8'), `${ALL}\n`);
+});
+
+test('race: a check in a copy gets the copy\'s src/ and root first on PYTHONPATH; the real tree\'s check does not', () => {
+    const { one, log } = setup();
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'src', 'mod.py'), '');
+    writeFileSync(join(dir, 'env.mjs'), "console.log('PYTHONPATH=' + process.env.PYTHONPATH);\n");
+    const check = `"${process.execPath}" env.mjs && "${process.execPath}" check.mjs`;
+    writeFileSync(join(dir, 'routes.json'), JSON.stringify({
+        '"tools"': [tools(['read_file', { path: 'one.txt' }])],
+        '"max_tokens":16384': [block(one, edit('start', ALL))],
+    }));
+    const { text, isError } = call({ prompt: 'x', files: [one], check, log_file: log }, [],
+        { MOCK_ROUTES: join(dir, 'routes.json'), PYTHONPATH: 'from-env' });
+    assert.equal(isError, false, text);
+    const seen = readFileSync(log, 'utf8').match(/PYTHONPATH=(.*)/)[1].split(delimiter);
+    assert.equal(seen.length, 3, seen.join(' | '));
+    assert.match(seen[0], /wgpt-attempt-\w+[/\\]src$/);
+    assert.equal(seen[1], dirname(seen[0]));
+    assert.equal(seen[2], 'from-env');
+});
+
+test('race: every check failing the same way, and a package linked back into the real tree, are warned about', () => {
+    const { log } = setup();
+    // The code under test lives in lib/, which node_modules links back to: every copy's check runs the real lib.
+    mkdirSync(join(dir, 'lib'));
+    mkdirSync(join(dir, 'node_modules', '@me'), { recursive: true });
+    const lib = join(dir, 'lib', 'index.js');
+    writeFileSync(lib, 'export const f = () => 1;\n');
+    symlinkSync(join(dir, 'lib'), join(dir, 'node_modules', '@me', 'lib'), 'junction');
+    // The same failure every time, only its path and timing differ.
+    writeFileSync(join(dir, 'same.mjs'), "console.log(`AssertionError in ${process.cwd()}: f() returned 1 (took ${Math.round(Math.random() * 90) + 10} ms)`);\n" +
+        'process.exit(1);\n');
+    const check = `"${process.execPath}" same.mjs`;
+    writeFileSync(join(dir, 'routes.json'), JSON.stringify({
+        '"tools"': [tools(['edit', { path: 'lib/index.js', search: '1', replace: '2' }], ['run_check']),
+            tools(['edit', { path: 'lib/index.js', search: '2', replace: '3' }], ['run_check'])],
+        '"max_tokens":16384': [block(lib, edit('export const f = () => 1;', 'export const f = () => 4;'))],
+    }));
+    const { text, isError } = call({ prompt: 'x', files: [lib], check, cwd: dir, max_steps: 2, log_file: log }, [], { MOCK_ROUTES: join(dir, 'routes.json') });
+    assert.equal(isError, true);
+    assert.match(text, /warning: all 3 check runs failed with the same output, whatever the edits: the check setup may be wrong \(for example, it is not testing the edited copy\)/);
+    assert.match(text, /warning: node_modules\/@me\/lib links to .* in the real tree, so a check in a copy that imports "@me\/lib" runs the original lib[/\\]index\.js, not the edits/);
+    assert.match(text, /note: the tool loop used all 2 steps; max_steps \(--max-steps\) raises the cap, up to 40\./);
+    assert.match(text, /fallback: opencode/);
+    const l = readFileSync(log, 'utf8');
+    // The probe runs before the first check.
+    assert.ok(l.indexOf('!!! WARNING: node_modules/@me/lib') < l.indexOf('AssertionError in'), 'warned before the first check ran');
+    assert.match(l, /!!! WARNING: all 3 check runs failed with the same output/);
+    assert.equal(readFileSync(lib, 'utf8'), 'export const f = () => 1;\n');
+});
+
+test('race: different failures are not blamed on the check', () => {
+    const { one, check } = setup();
+    writeFileSync(join(dir, 'routes.json'), JSON.stringify({
+        '"tools"': [tools(['edit', { path: 'one.txt', search: 'start', replace: 'alpha' }], ['run_check'])],
+        '"max_tokens":16384': [block(one, edit('start', 'beta'))],
+    }));
+    const { text, isError } = call({ prompt: 'x', files: [one], check, max_steps: 1 }, [], { MOCK_ROUTES: join(dir, 'routes.json') });
+    assert.equal(isError, true);
+    assert.doesNotMatch(text, /same output/);
 });

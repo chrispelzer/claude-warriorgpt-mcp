@@ -130,7 +130,7 @@ async function main() {
     if (!opts.json) console.log(res.text);
     console.log(JSON.stringify({ ok: res.ok, attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}),
         ...(res.verified !== undefined ? { verified: res.verified } : {}), files: res.files, tokens: res.usage,
-        ...(res.fallback ? { fallback: res.fallback } : {}), ms: Date.now() - started }));
+        ...(res.fallback ? { fallback: res.fallback } : {}), ...(res.warnings ? { warnings: res.warnings } : {}), ms: Date.now() - started }));
     return !res.ok ? 4 : 0;
 }
 

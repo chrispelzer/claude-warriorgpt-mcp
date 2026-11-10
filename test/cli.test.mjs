@@ -145,3 +145,25 @@ test('--log keeps every reply and check output', () => {
     assert.match(log, /--- attempt 2: reply could not be applied/);
     assert.match(log, /=== gave up after 2 attempts/);
 });
+
+test('the JSON line carries warnings; a check that fails the same way every time is blamed on the check', () => {
+    const { one, prompt } = setup();
+    writeFileSync(join(dir, 'same.mjs'), "console.log('cannot import pkg (took ' + Date.now() % 1000 + 'ms)'); process.exit(1);\n");
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', `"${process.execPath}" same.mjs`, '--no-loop', '--max-attempts', '2'],
+        { replies: [block(one, edit('start', 'bad')), block(one, edit('bad', 'worse'))] });
+    assert.equal(r.code, 4);
+    assert.match(r.out, /warning: all 2 check runs failed with the same output/);
+    assert.equal(r.json.warnings.length, 1);
+    assert.match(r.json.warnings[0], /the check setup may be wrong/);
+});
+
+test('a check that times out says how to give it longer', () => {
+    const { one, prompt } = setup();
+    writeFileSync(join(dir, 'slow.mjs'), 'setTimeout(() => {}, 5000);\n');
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', `"${process.execPath}" slow.mjs`, '--no-loop', '--max-attempts', '1',
+        '--check-timeout', '1'], { replies: [block(one, edit('start', 'good'))] });
+    assert.equal(r.code, 4);
+    assert.match(r.out, /Last check timed out after 1s/);
+    assert.match(r.out, /note: the check timed out after 1 s; check_timeout_s \(--check-timeout\) raises it, up to 3600\./);
+    assert.equal(r.json.warnings, undefined, 'one run is not a pattern');
+});
