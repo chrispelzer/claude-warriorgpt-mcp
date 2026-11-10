@@ -26,7 +26,10 @@ Reinstall after changes, then start a new Claude Code session and check `/mcp`.
 
 ## Layout
 
-- `warriorgpt-mcp.mjs`: the MCP server (stdio JSON-RPC) providing `ask_warriorgpt`.
+- `warriorgpt-mcp.mjs`: the MCP server (stdio JSON-RPC) providing `ask_warriorgpt` and the job tools.
+- `jobs.mjs`: background jobs for the server (queue, status, cancel, results kept for an hour).
+- `limit.mjs`: the request limit shared by every job and, through lock files, every process on the machine.
+- `retry.mjs`: when a request is sent again (429, dropped connection, cut stream) and how long to wait.
 - `warriorgpt-delegate.mjs`: runner that hands tasks to OpenCode workers in a git worktree.
 - `common.mjs`: shared API base, default model, API key lookup, state paths.
 - `delegate/`: worker rules (`WORKER_RULES.md`) and the OpenCode agent definitions (`opencode/agents/`) the runner uses.

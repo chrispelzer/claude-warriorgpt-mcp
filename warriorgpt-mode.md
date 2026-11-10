@@ -66,14 +66,15 @@ and every file is restored if it never does. Add `verify` (`--verify`) when the
 tests are thin and the spec has rules they miss: after the check passes, the
 model runs a short self-check in the tool loop (up to 8 steps) that tests those
 rules with Node asserts and fixes the code when it breaks a stated rule. A
-checked call can take several minutes, and an
-MCP call blocks this session the whole time, so run checked or multi-attempt
-tasks with the `warriorgpt-ask` CLI through Bash with `run_in_background`
-(see the README, "Background runs"), keep working, and review the diff when it
-exits. Exit 0 means the check passed; with `verify`, that holds even when the
-self-check ran out of steps (its edits are undone if they broke the check).
-Exit 4 means the check never passed and every file
-is back as it was: do not retry the same call, hand the task to `warrior-coder`
+checked call can take several minutes, longer than one MCP call may wait, so
+start checked tasks with `start_warriorgpt_job` (same arguments), keep working,
+poll `get_warriorgpt_job_status` about every 30 s, and when it is done read
+`get_warriorgpt_job_result` and review the diff. The `warriorgpt-ask` CLI
+through Bash with `run_in_background` also works (see the README, "Background
+jobs"). A passing result, or CLI exit 0, means the check passed; with
+`verify`, that holds even when the self-check ran out of steps (its edits are
+undone if they broke the check). `fallback: opencode` in the result, or exit 4,
+means the check never passed and every file is back as it was: do not retry the same call, hand the task to `warrior-coder`
 (below), which can run the tests and read around the code.
 
 Pick `model` per task: `local.qwen3.8-27b` (the default) for writing code,

@@ -1,6 +1,6 @@
 # claude-warriorgpt-mcp
 
-An MCP server that gives [Claude Code](https://code.claude.com/) one tool, `ask_warriorgpt`, which calls Wayne State's [WarriorGPT](https://warriorgpt.wayne.edu/) API directly. Your Claude Code session stays on your Claude plan; only the tool call goes to WarriorGPT, so routine code generation does not count against your Claude usage.
+An MCP server that gives [Claude Code](https://code.claude.com/) a tool, `ask_warriorgpt` (plus job tools to run it in the background), which calls Wayne State's [WarriorGPT](https://warriorgpt.wayne.edu/) API directly. Your Claude Code session stays on your Claude plan; only the tool call goes to WarriorGPT, so routine code generation does not count against your Claude usage.
 
 It is plain Node with no dependencies and works on macOS, Linux, and Windows.
 
@@ -141,17 +141,42 @@ warriorgpt-ask --prompt-file brief.md --files src/a.js --files test/a.test.js \
   --context src/util.js --check "npm test" --cwd .
 ```
 
-Flags: `--prompt` or `--prompt-file`, `--files` and `--context` (repeat or comma-separate), `--check`, `--cwd`, `--parallel`, `--no-loop-lane`, `--max-steps`, `--verify`, `--no-loop`, `--max-attempts`, `--check-timeout`, `--log`, `--output-file`, `--model`, `--system-file`, `--max-tokens`, `--loop-max-tokens`, `--think-budget`, `--loop-think-budget`, `--loop-thinking`, `--json`. Relative paths resolve against the current folder. It prints the result, then one JSON line `{ok, attempts, steps?, verified?, files, tokens, ms}` (`steps` only when the tool loop ran, `verified` only with `--verify`: true when the self-check finished, false when it ran out of steps). Exit codes: 0 passed (or no check), 1 the reply could not be applied (no check), 2 usage error, 3 WarriorGPT unreachable or returned an error, 4 the check never passed and every file was restored. On 4 the JSON line carries `"fallback": "opencode"`, and the MCP tool returns an error with `structuredContent: {ok: false, fallback: "opencode", attempts, steps}`: the task needs an agent that can run the code and read around it, so hand it to OpenCode (`warriorgpt-delegate` or an OpenCode subagent) rather than retrying the same call.
+Flags: `--prompt` or `--prompt-file`, `--files` and `--context` (repeat or comma-separate), `--check`, `--cwd`, `--parallel`, `--no-loop-lane`, `--max-steps`, `--verify`, `--no-loop`, `--max-attempts`, `--check-timeout`, `--log`, `--output-file`, `--model`, `--system-file`, `--max-tokens`, `--loop-max-tokens`, `--think-budget`, `--loop-think-budget`, `--loop-thinking`, `--max-concurrency`, `--json`. Relative paths resolve against the current folder. It prints the result, then one JSON line `{ok, attempts, steps?, verified?, files, tokens, ms}` (`steps` only when the tool loop ran, `verified` only with `--verify`: true when the self-check finished, false when it ran out of steps). Exit codes: 0 passed (or no check), 1 the reply could not be applied (no check), 2 usage error, 3 WarriorGPT unreachable or returned an error, 4 the check never passed and every file was restored. On 4 the JSON line carries `"fallback": "opencode"`, and the MCP tool returns an error with `structuredContent: {ok: false, fallback: "opencode", attempts, steps}`: the task needs an agent that can run the code and read around it, so hand it to OpenCode (`warriorgpt-delegate` or an OpenCode subagent) rather than retrying the same call.
 
-### Background runs
+### Background jobs
 
-An MCP tool call blocks the Claude session until it returns, and a checked task with retries can take several minutes. For anything with `check` or more than one attempt, have Claude start the CLI with the Bash tool's `run_in_background` instead. Claude keeps working and gets notified when it exits:
+An MCP tool call blocks until it returns, and a checked task can run for several minutes, longer than an MCP client waits on one call. For anything with `check`, use the job tools instead of `ask_warriorgpt`:
+
+| Tool | What it does |
+|---|---|
+| `start_warriorgpt_job` | Takes the same arguments as `ask_warriorgpt`, starts the run in the server process and returns a `job_id` at once. Bad arguments (for example `check` without `files`) fail here, not later. |
+| `get_warriorgpt_job_status` | `job_id` gives the state (`queued`, `running`, `cancelling`, `done`, `failed`, `cancelled`), the time elapsed, progress (one-shot replies, the latest tool-loop step, request retries), the last `log_lines` log lines (default 15, max 100) and `next_poll_s`. With no `job_id` it lists every job. |
+| `get_warriorgpt_job_result` | The result of a finished job, in the same shape `ask_warriorgpt` returns: the text, `isError`, and `structuredContent` with `ok`, `fallback` and `attempts` when the check never passed. A job that has not finished answers with its state instead. |
+| `cancel_warriorgpt_job` | Stops the job's requests and checks and puts every file it may change back as it was. A queued job is dropped at once; a running one usually stops within a second or two, and the call waits up to 5 s for that. |
+
+The status and result tools take `wait_s` (at most 30): the call waits that long for the job to finish, and answers as soon as it does. The tool descriptions ask the model to poll about every 30 s (15 s in the first minute, 60 s after five minutes) and to do other work in between.
+
+Jobs live in the server process. At most three run at once (`WARRIORGPT_MAX_JOBS`) and the rest queue, up to 20. Finished jobs are kept for an hour. When the client disconnects, running jobs are cancelled and their files restored, since nobody is left to read the results. A plain `ask_warriorgpt` call still in flight finishes as before.
+
+The `warriorgpt-ask` CLI with the Bash tool's `run_in_background` still works. Claude keeps working, gets notified when it exits, reads the summary and the JSON line, and reviews `git diff`:
 
 ```sh
 warriorgpt-ask --prompt-file /tmp/brief.md --files src/a.js,test/a.test.js --check "npm test" --cwd "$PWD"
 ```
 
-Claude then reads the last lines of the output (the summary and the JSON line) and reviews `git diff`. A rule for your `CLAUDE.md`: "For WarriorGPT tasks with a check, run `warriorgpt-ask` with Bash `run_in_background`; use the `ask_warriorgpt` tool only for quick, unchecked calls."
+A rule for your `CLAUDE.md`: "For WarriorGPT tasks with a check, use `start_warriorgpt_job` and poll it (or run `warriorgpt-ask` with Bash `run_in_background`); use the `ask_warriorgpt` tool only for quick, unchecked calls."
+
+### Retries and the request limit
+
+The gateway lets each API key have 6 requests in flight and answers the rest with 429 and a `Retry-After` header. A checked job sends `parallel` one-shot attempts plus the loop lane, so two jobs at once could go over. Every request the server or the CLI sends therefore takes a slot from one limit, 6 by default. The limit is shared by every job in the process, and through lock files by every `warriorgpt-mcp` and `warriorgpt-ask` on the machine that uses the same key. The lock files are in `slots-<key hash>` in the state directory. A slot left behind by a process that crashed is taken over once its pid is gone, or once the file has gone untouched for two minutes (a live holder touches it every 30 s). Set the limit with `WARRIORGPT_MAX_CONCURRENCY` or `--max-concurrency <n>` (on the CLI, or at registration: `claude mcp add ... -- warriorgpt-mcp --max-concurrency 4`); 0 turns it off. A request waiting for a slot simply waits. Lower the limit if you also use the key from somewhere else.
+
+A request is sent again, up to 5 more times, when:
+
+- the gateway answers 429 for a busy key. The wait is the server's `Retry-After` (seconds, fractions too, or an HTTP date) or the backoff, whichever is longer. A quota 429 (`quota_exceeded`) or a `Retry-After` over 60 s fails at once.
+- the connection fails before any reply arrives (`fetch failed`, `ECONNRESET`, `ECONNREFUSED`, a timeout, `socket hang up`). Certificate errors are not retried.
+- the stream is cut short: the gateway's `upstream_stream_incomplete` error event, `finish_reason: "incomplete"`, or a stream that closes without a finish reason. Nothing from a cut reply is used.
+
+The backoff starts at 1 s and doubles, up to 30 s, with jitter. Each retry is logged to `log_file`, to stderr, and to a job's log, for example `--- WarriorGPT: 429 concurrency_limit_exceeded: Too many concurrent requests for this API key (limit 6). ...; retry 1 of 5 in 5.0 s`. When the retries run out, the error carries the server's message and says how many tries it took. A slot is released while a request waits to retry.
 
 Models:
 
@@ -166,6 +191,10 @@ Models:
 |---|---|
 | `WARRIORGPT_API_KEY` | API key. If unset, the server reads the `warriorgpt-api-key` item from the macOS Keychain or the Linux Secret Service. |
 | `WARRIORGPT_MODEL` | Default model when a call does not pass `model`. |
+| `WARRIORGPT_MAX_CONCURRENCY` | WarriorGPT requests in flight at once, shared by every job and every `warriorgpt-mcp` and `warriorgpt-ask` on the machine. Default 6; 0 turns the limit off. The `--max-concurrency` flag overrides it. |
+| `WARRIORGPT_MAX_JOBS` | Jobs the MCP server runs at once; the rest queue. Default 3. |
+| `WARRIORGPT_MAX_RETRIES` | Times a request is sent again after a 429, a dropped connection or a cut stream. Default 5; 0 turns retries off. |
+| `WARRIORGPT_RETRY_BASE_MS` | First retry backoff in ms, doubled on each retry up to 30 s. Default 1000. |
 
 Pass variables at registration with `claude mcp add ... -e WARRIORGPT_MODEL=local.gpt-oss-120b -- ...`. Avoid passing the API key this way: Claude Code stores it in plain text in its config file.
 
@@ -229,7 +258,8 @@ If you also set up the [OpenCode subagent](docs/opencode-subagent.md), the same 
 | `secret-tool: command not found` (Linux) | Install `libsecret-tools` (Debian/Ubuntu) or `libsecret` (Fedora/Arch), or use `WARRIORGPT_API_KEY` instead. |
 | WarriorGPT 401 | The key is wrong or revoked. Create a new one and store it again. |
 | WarriorGPT 500 on one model | That model is down on the gateway. Try another `model`. |
-| 429 / `quota_exceeded` | Rate limit or quota. Wait, or let Claude do the task. |
+| 429 `concurrency_limit_exceeded` after retries | Something else is using the same key at the same time. Lower `WARRIORGPT_MAX_CONCURRENCY`, or wait. |
+| 429 / `quota_exceeded` | Rate limit or quota. Quota denials are not retried. Wait, or let Claude do the task. |
 | `/mcp` shows warriorgpt failed (Windows) | The server was registered without `cmd /c`. Remove it with `claude mcp remove warriorgpt` and redo install step 3. |
 | `/mcp` shows warriorgpt failed | `warriorgpt-mcp` is not on Claude Code's PATH, often after switching Node versions. Reinstall, or register the full path from `which warriorgpt-mcp` (`where warriorgpt-mcp` on Windows). |
 
