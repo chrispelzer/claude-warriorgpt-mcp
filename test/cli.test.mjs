@@ -236,3 +236,20 @@ test('in the tool loop, a check that stops being able to run is a setup problem,
     assert.equal(readFileSync(join(dir, 'requests.jsonl'), 'utf8').trim().split('\n').length, 3, 'no step after the broken run');
     assert.equal(readFileSync(one, 'utf8'), 'start\n', 'the one-shot edit was restored');
 });
+
+test('a check in the real tree also gets the tree\'s src/ first on PYTHONPATH', () => {
+    const { one, prompt } = setup();
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'seen.mjs'), "import { readFileSync, appendFileSync } from 'node:fs';\n" +
+        "appendFileSync(new URL('./seen.txt', import.meta.url), (process.env.PYTHONPATH || '') + '\\n');\n" +
+        "if (!readFileSync(new URL('./one.txt', import.meta.url), 'utf8').includes('good')) process.exit(1);\n");
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', `"${process.execPath}" seen.mjs`, '--no-loop', '--cwd', dir],
+        { replies: [block(one, edit('start', 'good'))], env: { PYTHONPATH: '/elsewhere' } });
+    assert.equal(r.code, 0, r.err);
+    const seen = readFileSync(join(dir, 'seen.txt'), 'utf8').trim().split('\n');
+    assert.ok(seen.length > 0);
+    for (const line of seen) {
+        assert.deepEqual(line.split(process.platform === 'win32' ? ';' : ':'), [join(dir, 'src'), dir, '/elsewhere'],
+            'every check run, including the one in the real tree, tests this tree first');
+    }
+});

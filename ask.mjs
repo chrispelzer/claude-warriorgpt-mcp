@@ -840,7 +840,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     // in it, so the user turn holds the tool instructions, the files as they are now and the lead.
     const loopRun = (mode, lead, steps, history = null) => runLoop({
         chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...contextPaths], cwd, mode,
-        runCheck: () => runCheck(check, cwd, checkTimeout, stop).then(noteCheck).then(throwIfBroken), runNode: (code) => runNode(code, cwd, stop, contextPaths), log,
+        runCheck: () => runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd)).then(noteCheck).then(throwIfBroken), runNode: (code) => runNode(code, cwd, stop, contextPaths), log,
         maxSteps: steps, maxTokens: mode === 'verify' ? LANE_MAX_TOKENS : loopMaxTokens, onRunaway: () => { runawaySeen = true; }, system: mode === 'verify' ? VERIFY_SYSTEM : FIX_SYSTEM,
         ...(history ? { history } : {}), verifyThink: VERIFY_THINK_BUDGET, verifyMs: verifyMs,
         user: history
@@ -1101,7 +1101,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                     withLockRetry(() => writeFileSync(f, buf));
                 }
             }
-            const ran = await runCheck(check, cwd, checkTimeout, stop);
+            const ran = await runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd));
             stopped();
             log(`--- [loop] applied to the real files; check ${ran.ok ? 'passed' : `failed (exit ${ran.code})`} in ${ran.ms} ms`);
             if (ran.ok) {
@@ -1133,7 +1133,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             if (best?.plan && (won || !laneDone)) withLockRetry(() => writePlan(best.plan));
             if (won) {
                 // Confirm in the real tree: it differs from the copy in .git and anything the check leaves behind.
-                const ran = await runCheck(check, cwd, checkTimeout, stop);
+                const ran = await runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd));
                 stopped();
                 log(`--- [a${won.i + 1}] applied to the real files; check ${ran.ok ? 'passed' : `failed (exit ${ran.code})`} in ${ran.ms} ms`);
                 if (ran.ok) {
@@ -1224,7 +1224,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             }
             if (!check) return done(summary, changedFiles());
 
-            const ran = throwIfBroken(noteCheck(await runCheck(check, cwd, checkTimeout, stop)));
+            const ran = throwIfBroken(noteCheck(await runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd))));
             stopped();
             log(`--- attempt ${attempt}: check ${ran.ok ? 'passed' : ran.timedOut ? 'timed out' : `failed (exit ${ran.code})`}\n${tail(ran.output, 20000)}`);
             if (ran.ok) {
@@ -1346,7 +1346,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             verified = false;
             const why = res.error ? ` (${res.error})` : '';
             // After an error the edit count is lost (res.edits is 0), so the check runs again then too.
-            const stillOk = (!res.edits && !res.error) || (await runCheck(check, cwd, checkTimeout)).ok;
+            const stillOk = (!res.edits && !res.error) || (await runCheck(check, cwd, checkTimeout, undefined, copyEnv(cwd))).ok;
             if (stillOk) {
                 verifyNote = `verify: incomplete${why}: the self-check ran out of ${res.timedOut ? 'time' : 'steps'}${res.edits ? `; kept its ${nEdits}, since the check still passes` : ''}`;
             } else {

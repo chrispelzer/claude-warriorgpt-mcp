@@ -112,7 +112,8 @@ async function removeCopy(dir, links) {
 
 // A check run in a copy still imports whatever its environment points at: a Python package installed in editable
 // mode resolves to the real tree, so the copy's edits would go untested. The copy's src/ and root go first on
-// PYTHONPATH, ahead of any existing value.
+// PYTHONPATH, ahead of any existing value. Used for the real tree too, so a venv whose editable
+// install points somewhere else (a cloned project, a stale path) still tests the files being edited.
 export function copyEnv(dir, base = process.env) {
     const src = join(dir, 'src');
     return { PYTHONPATH: [...(existsSync(src) ? [src] : []), dir, ...(base.PYTHONPATH ? [base.PYTHONPATH] : [])].join(delimiter) };
