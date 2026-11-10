@@ -9,7 +9,8 @@ import { availableParallelism } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
 import { requestSlot } from './limit.mjs';
-import { backoffMs, errorBody, isTransientNetworkError, maxRetries, rateLimitWait, retryAfterMs, sleep } from './retry.mjs';
+import { KIND_CAPS, backoffMs, errorBody, headerTimeoutMs, idleTimeoutMs, isTransientNetworkError, maxRetries, serverWaitMs,
+    sleep, statusRetry } from './retry.mjs';
 
 const API_URL = `${API_BASE}/chat/completions`;
 export const MODELS = {
@@ -113,10 +114,12 @@ export const thinkingSwitchState = () => (thinkingSwitchRejected ? 'rejected' : 
 // Collects an OpenAI-style SSE stream into the shape of a non-streamed reply. stopAt(reasoningChars) is asked
 // after every chunk until something is written; wrap (an AbortSignal) cancels at once unless writing has begun.
 const WRAPPED = Symbol('wrapped');
-async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
+const FINISHED = new Set(['stop', 'length', 'tool_calls']);
+export async function readStream(body, { stopAt, mark, progress = {}, wrap, tick } = {}) {
     const decoder = new TextDecoder();
     let buf = '', content = '', reasoningText = '', reasoning = 0, finish, usage, stopped = false;
     const calls = [];
+    let latest = -1;
     const take = (line) => {
         if (!line.startsWith('data:')) return;
         const raw = line.slice(5).trim();
@@ -140,13 +143,17 @@ async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
             content += choice.delta.content;
             progress.chars = (progress.chars || 0) + choice.delta.content.length;
         }
-        // Tool calls arrive in pieces keyed by index: the id and name first, then the arguments in fragments.
+        // Tool calls arrive in pieces: the id and name first, then the arguments in fragments. A piece belongs to the
+        // call with its id, else to its index, else (some servers send no index) to the latest call; a new id with
+        // no index starts a call. The first name sticks: servers that repeat it would otherwise double it.
         for (const d of choice?.delta?.tool_calls || []) {
             mark?.('content');
-            const i = d.index ?? calls.length;
+            const byId = d.id ? calls.findIndex((c) => c?.id === d.id) : -1;
+            const i = byId >= 0 ? byId : d.index ?? (d.id || latest < 0 ? calls.length : latest);
             const c = calls[i] ||= { id: '', type: 'function', function: { name: '', arguments: '' } };
-            if (d.id) c.id = d.id;
-            if (d.function?.name) c.function.name += d.function.name;
+            latest = i;
+            if (d.id && !c.id) c.id = d.id;
+            if (d.function?.name && !c.function.name) c.function.name = d.function.name;
             if (d.function?.arguments) c.function.arguments += d.function.arguments;
         }
         if (choice?.finish_reason) finish = choice.finish_reason;
@@ -175,6 +182,7 @@ async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
         if (next.done) break;
         const part = next.value;
         progress.bytes = (progress.bytes || 0) + part.length;
+        tick?.();
         buf += typeof part === 'string' ? part : decoder.decode(part, { stream: true });
         let i;
         while ((i = buf.indexOf('\n')) >= 0) {
@@ -188,13 +196,26 @@ async function readStream(body, { stopAt, mark, progress = {}, wrap } = {}) {
         }
     }
     if (!stopped) take(buf.trim());
-    // A stream that closes without a finish reason was cut short: its content is partial, so it is not a reply.
-    if (!stopped && (!finish || finish === 'incomplete')) {
-        throw Object.assign(new Error('the stream ended before the reply finished'), { retry: 'the stream was cut off before it finished' });
+    // A stream that closes without a finish reason, or with one other than stop, length or tool_calls (the gateway's
+    // incomplete, an upstream error), was cut short: its content is partial, so it is not a reply.
+    if (!stopped && !FINISHED.has(finish)) {
+        throw Object.assign(new Error(`the stream ended before the reply finished${finish ? ` (finish_reason ${finish})` : ''}`),
+            { retry: `the stream was cut off before it finished${finish ? ` (finish_reason ${finish})` : ''}` });
     }
     return { usage, reasoningChars: reasoning, reasoningText, stopped,
         choices: [{ finish_reason: stopped ? 'think_budget' : finish,
             message: { content, ...(calls.length ? { tool_calls: calls.filter(Boolean) } : {}) } }] };
+}
+
+// Tool results are matched to calls by id, so ids must be unique: an empty or repeated one gets its own.
+export function uniqueIds(ids) {
+    const seen = new Set();
+    return ids.map((id, i) => {
+        let out = id && !seen.has(id) ? id : `call_${i}`;
+        for (let n = 2; seen.has(out); n++) out = `call_${i}_${n}`;
+        seen.add(out);
+        return out;
+    });
 }
 
 // Requests in flight, for the "WarriorGPT is working" marker file; parallel requests share it.
@@ -222,6 +243,7 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
     let data;
     const tries = maxRetries() + 1;
     const started = Date.now();
+    const kinds = {}; // retries so far by kind, for the per-kind caps
     try {
         for (let n = 1; ; n++) {
             let release, wait;
@@ -238,10 +260,12 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
                 data = await chatOnce();
                 break;
             } catch (err) {
-                if (!err.retry || n >= tries) {
+                const kind = err.kind || 'busy';
+                if (!err.retry || n >= tries || (KIND_CAPS[kind] !== undefined && (kinds[kind] || 0) >= KIND_CAPS[kind])) {
                     if (err.retry && n > 1) err.message += ` (gave up after ${n} tries in ${Math.round((Date.now() - started) / 1000)} s)`;
                     throw err;
                 }
+                kinds[kind] = (kinds[kind] || 0) + 1;
                 wait = Math.max(err.waitMs || 0, backoffMs(n));
                 const note = `--- WarriorGPT: ${err.retry}; retry ${n} of ${tries - 1} in ${(wait / 1000).toFixed(1)} s`;
                 say?.(note);
@@ -258,66 +282,92 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
     } finally {
         if (--inFlight === 0) rmSync(activeFile, { force: true });
     }
+    // One try. The response must start within the header timeout, and then no gap between chunks may pass the idle
+    // timeout; either one is a retryable timeout. Errors carry retry (why), waitMs and kind when worth another try.
     async function chatOnce() {
         const cancel = new AbortController();
-        const send = (withSwitch) => fetch(API_URL, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-            // Streamed: the gateway ends a non-streamed request that runs past 120 s with a 500.
-            body: JSON.stringify({ model, messages, max_tokens: maxTokens, ...sampling, ...(tools ? { tools, parallel_tool_calls: true } : {}),
-                ...(withSwitch ? { chat_template_kwargs: { enable_thinking: false } } : {}),
-                stream: true, stream_options: { include_usage: true } }),
-            signal: AbortSignal.any([cancel.signal, AbortSignal.timeout(15 * 60 * 1000), ...(signal ? [signal] : [])]),
-        });
-        let res;
+        let timedOut = null;
+        let timer = null;
+        const arm = (what, ms) => {
+            clearTimeout(timer);
+            if (ms > 0) timer = setTimeout(() => { timedOut = what; cancel.abort(); }, ms);
+        };
+        const idleMs = idleTimeoutMs();
+        const secs = (ms) => Math.round(ms / 100) / 10;
+        const send = (withSwitch) => {
+            arm('headers', headerTimeoutMs());
+            return fetch(API_URL, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+                // Streamed: the gateway ends a non-streamed request that runs past 120 s with a 500.
+                body: JSON.stringify({ model, messages, max_tokens: maxTokens, ...sampling, ...(tools ? { tools, parallel_tool_calls: true } : {}),
+                    ...(withSwitch ? { chat_template_kwargs: { enable_thinking: false } } : {}),
+                    stream: true, stream_options: { include_usage: true } }),
+                signal: AbortSignal.any([cancel.signal, ...(signal ? [signal] : [])]),
+            });
+        };
         try {
-            let withSwitch = noThinking && !thinkingSwitchRejected;
-            res = await send(withSwitch);
-            if (!res.ok && withSwitch && (res.status === 400 || res.status === 422)) {
-                // A strict server refused the thinking switch: remember that for this process and resend without it.
-                thinkingSwitchRejected = true;
-                await res.text().catch(() => '');
-                withSwitch = false;
-                res = await send(false);
+            let res;
+            try {
+                let withSwitch = noThinking && !thinkingSwitchRejected;
+                res = await send(withSwitch);
+                if (!res.ok && withSwitch && (res.status === 400 || res.status === 422)) {
+                    // A strict server refused the thinking switch: remember that for this process and resend without it.
+                    thinkingSwitchRejected = true;
+                    await res.text().catch(() => '');
+                    withSwitch = false;
+                    res = await send(false);
+                }
+            } catch (err) {
+                if (signal?.aborted) throw cancelled();
+                if (timedOut === 'headers') {
+                    throw Object.assign(new ApiError(`WarriorGPT did not start answering within ${secs(headerTimeoutMs())} s`),
+                        { retry: `no response within ${secs(headerTimeoutMs())} s`, kind: 'timeout' });
+                }
+                const why = `${err.message}${err.cause?.code || err.cause?.message ? ` (${err.cause.code || err.cause.message})` : ''}`;
+                throw Object.assign(new ApiError(`WarriorGPT unreachable: ${why}`),
+                    isTransientNetworkError(err) ? { retry: `unreachable: ${why}` } : {});
             }
-        } catch (err) {
-            if (signal?.aborted) throw cancelled();
-            const why = `${err.message}${err.cause?.code || err.cause?.message ? ` (${err.cause.code || err.cause.message})` : ''}`;
-            throw Object.assign(new ApiError(`WarriorGPT unreachable: ${why}`),
-                isTransientNetworkError(err) ? { retry: `unreachable: ${why}` } : {});
+            mark('headers');
+            arm('idle', idleMs);
+            if (!res.ok) {
+                const text = await res.text().catch(() => '');
+                const { message, code } = errorBody(text);
+                const get = (h) => res.headers?.get?.(h) ?? null;
+                // 429 and upstream failures: wait at least what the server says. A quota denial fails now, with its message.
+                const plan = statusRetry(res.status, code, get);
+                const wait = serverWaitMs(get);
+                throw Object.assign(new ApiError(`WarriorGPT ${res.status}${code ? ` (${code})` : ''}: ${message.slice(0, 500)}` +
+                    `${wait !== null ? ` [Retry-After ${secs(wait)} s]` : ''}`),
+                    plan ? { retry: `${res.status}${code ? ` ${code}` : ''}: ${message.slice(0, 200)}`, waitMs: plan.waitMs, kind: plan.kind } : {});
+            }
+            let reply;
+            try {
+                const stopAt = thinkBudget > 0 ? (chars) => chars / CHARS_PER_TOKEN > thinkBudget : undefined;
+                reply = (res.headers?.get?.('content-type') || '').includes('text/event-stream')
+                    ? await readStream(res.body, { stopAt, mark, progress, wrap, tick: () => arm('idle', idleMs) }) : await res.json();
+            } catch (err) {
+                if (signal?.aborted) throw cancelled();
+                cancel.abort();
+                if (timedOut === 'idle') {
+                    throw Object.assign(new ApiError(`WarriorGPT reply broke off: no data for ${secs(idleMs)} s`),
+                        { retry: `the stream stalled (no data for ${secs(idleMs)} s)`, kind: 'timeout' });
+                }
+                // Requests are stateless, so a connection that dropped mid-reply is sent again from the start.
+                const retry = err.retry || (isTransientNetworkError(err) ? `the connection dropped ${progress.bytes ? 'mid-reply' : 'before the reply'}: ${err.message}` : undefined);
+                const out = err instanceof ApiError ? err : new ApiError(`WarriorGPT reply broke off: ${err.message}`);
+                if (retry) out.retry = retry;
+                throw out;
+            }
+            if (reply.choices?.[0]?.finish_reason === 'incomplete') {
+                throw Object.assign(new ApiError('WarriorGPT reply broke off: the stream ended before the reply finished (finish_reason incomplete)'),
+                    { retry: 'the stream was cut off (finish_reason incomplete)' });
+            }
+            if (reply.stopped) cancel.abort();
+            return reply;
+        } finally {
+            clearTimeout(timer);
         }
-        mark('headers');
-        if (!res.ok) {
-            const text = await res.text().catch(() => '');
-            if (res.status !== 429) throw new ApiError(`WarriorGPT ${res.status}: ${text.slice(0, 500)}`);
-            // Busy key: wait as long as the server says. A quota denial or a wait of minutes fails now, with its message.
-            const { message, code } = errorBody(text);
-            const after = retryAfterMs(res.headers?.get?.('retry-after'));
-            const waitMs = rateLimitWait(code, after);
-            throw Object.assign(new ApiError(`WarriorGPT 429${code ? ` (${code})` : ''}: ${message.slice(0, 500)}` +
-                `${after !== null ? ` [Retry-After ${Math.round(after / 100) / 10} s]` : ''}`),
-                waitMs === null ? {} : { retry: `429${code ? ` ${code}` : ''}: ${message.slice(0, 200)}`, waitMs });
-        }
-        let reply;
-        try {
-            const stopAt = thinkBudget > 0 ? (chars) => chars / CHARS_PER_TOKEN > thinkBudget : undefined;
-            reply = (res.headers?.get?.('content-type') || '').includes('text/event-stream')
-                ? await readStream(res.body, { stopAt, mark, progress, wrap }) : await res.json();
-        } catch (err) {
-            if (signal?.aborted) throw cancelled();
-            // A connection that dropped before any byte of the reply is the same as one that never opened.
-            const retry = err.retry || (!progress.bytes && isTransientNetworkError(err) ? `the connection dropped before the reply: ${err.message}` : undefined);
-            const out = err instanceof ApiError ? err : new ApiError(`WarriorGPT reply broke off: ${err.message}`);
-            if (retry) out.retry = retry;
-            cancel.abort();
-            throw out;
-        }
-        if (reply.choices?.[0]?.finish_reason === 'incomplete') {
-            throw Object.assign(new ApiError('WarriorGPT reply broke off: the stream ended before the reply finished (finish_reason incomplete)'),
-                { retry: 'the stream was cut off (finish_reason incomplete)' });
-        }
-        if (reply.stopped) cancel.abort();
-        return reply;
     }
     mark('end');
     const choice = data.choices?.[0];
@@ -333,7 +383,8 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
     // Reasoning tokens when the server reports them; otherwise estimated from the streamed reasoning text.
     const reasoning = data.usage?.completion_tokens_details?.reasoning_tokens
         ?? Math.round((data.reasoningChars ?? (choice?.message?.reasoning ?? choice?.message?.reasoning_content ?? '').length) / CHARS_PER_TOKEN);
-    const toolCalls = (choice?.message?.tool_calls || []).map((c, i) => ({ id: c.id || `call_${i}`,
+    const ids = uniqueIds((choice?.message?.tool_calls || []).map((c) => c.id));
+    const toolCalls = (choice?.message?.tool_calls || []).map((c, i) => ({ id: ids[i],
         name: c.function?.name || '', arguments: typeof c.function?.arguments === 'string' ? c.function.arguments
             : JSON.stringify(c.function?.arguments ?? {}) }));
     // Where the time went: response headers, first reasoning, first content or tool call, end (ms from send).

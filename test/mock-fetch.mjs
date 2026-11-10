@@ -15,7 +15,10 @@
 // MOCK_FAIL_FIRST (a JSON array) fails the first requests in turn, before any normal reply: "429" answers 429 with
 // Retry-After MOCK_RETRY_AFTER (default 0.2 s) and the gateway's concurrency message, "quota" a quota 429 with a
 // day-long Retry-After, "reset" throws as a reset connection does, "incomplete" streams half the reply and then
-// the gateway's upstream_stream_incomplete error event, with no finish reason.
+// the gateway's upstream_stream_incomplete error event, with no finish reason. "500", "502", "503" and "504" answer
+// with the gateway's body for that status; an object {status, code, headers} answers that status and headers.
+// "reset-mid" streams a little and then fails as a reset connection does; "hang" never answers (until aborted);
+// "stall" streams a little and then goes quiet (until aborted).
 // MOCK_TIMES gets each request's Date.now() as a line. MOCK_IN_FLIGHT gets the most requests open at once (a
 // request is open until its body is read to the end or aborted).
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
@@ -99,6 +102,28 @@ globalThis.fetch = async (url, init) => {
         const after = failure === '429' ? (process.env.MOCK_RETRY_AFTER || '0.2') : '86400';
         return { ok: false, status: 429, headers: { get: (h) => (h.toLowerCase() === 'retry-after' ? after : null) },
             text: async () => JSON.stringify(body) };
+    }
+    const gateway = { 500: 'internal_error', 502: 'upstream_unreachable', 503: 'upstream_unavailable', 504: 'upstream_timeout' };
+    if (gateway[failure] || (failure && typeof failure === 'object')) {
+        const status = typeof failure === 'object' ? failure.status : Number(failure);
+        const code = typeof failure === 'object' ? failure.code || 'upstream_error' : gateway[failure];
+        const headers = Object.fromEntries(Object.entries((typeof failure === 'object' && failure.headers) || {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
+        return { ok: false, status, headers: { get: (h) => headers[h.toLowerCase()] ?? null },
+            text: async () => JSON.stringify({ error: { message: `Upstream failed (${code}). Retry the request.`, type: 'server_error', code } }) };
+    }
+    const abortable = (signal) => new Promise((done, fail) => {
+        signal?.addEventListener('abort', () => fail(new DOMException('aborted', 'AbortError')), { once: true });
+    });
+    if (failure === 'hang') return abortable(init.signal);
+    if (failure === 'reset-mid' || failure === 'stall') {
+        const first = new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: { content: 'half a rep' } }] })}\n\n`);
+        const signal = init.signal;
+        const body = (async function* () {
+            yield first;
+            if (failure === 'stall') await abortable(signal);
+            throw new TypeError('terminated', { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) });
+        })();
+        return { ok: true, status: 200, headers: { get: () => 'text/event-stream' }, body };
     }
     if (failure === 'incomplete') {
         const enc = new TextEncoder();

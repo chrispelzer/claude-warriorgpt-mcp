@@ -6,7 +6,8 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, existsSync } from 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { backoffMs, errorBody, isTransientNetworkError, rateLimitWait, retryAfterMs } from '../retry.mjs';
+import { backoffMs, errorBody, isTransientNetworkError, rateLimitWait, retryAfterMs, serverWaitMs, statusRetry } from '../retry.mjs';
+import { readStream, uniqueIds } from '../ask.mjs';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
 const SERVER = resolve(here, '../warriorgpt-mcp.mjs');
@@ -122,4 +123,99 @@ test('a stream that keeps getting cut off ends in an error, and nothing is writt
     assert.match(text, /upstream_stream_incomplete/);
     assert.match(text, /gave up after 2 tries/);
     assert.equal(existsSync(out), false);
+});
+
+const headers = (h) => (name) => h[name] ?? null;
+
+test('gateway 5xx: 502/503 retried like a busy key, 504 as a timeout, 500 as a server error; x-should-retry overrides', () => {
+    assert.deepEqual(statusRetry(502, 'upstream_unreachable', headers({})), { kind: 'busy', waitMs: 0 });
+    assert.deepEqual(statusRetry(503, '', headers({ 'retry-after': '2' })), { kind: 'busy', waitMs: 2000 });
+    assert.deepEqual(statusRetry(504, 'upstream_timeout', headers({})), { kind: 'timeout', waitMs: 0 });
+    assert.deepEqual(statusRetry(500, 'internal_error', headers({})), { kind: 'server', waitMs: 0 });
+    assert.equal(statusRetry(400, '', headers({})), null);
+    assert.equal(statusRetry(401, '', headers({})), null);
+    assert.equal(statusRetry(502, '', headers({ 'x-should-retry': 'false' })), null);
+    assert.deepEqual(statusRetry(400, '', headers({ 'x-should-retry': 'true' })), { kind: 'busy', waitMs: 0 });
+    assert.equal(statusRetry(429, 'quota_exceeded', headers({})), null);
+});
+
+test('retry-after-ms wins over Retry-After', () => {
+    assert.equal(serverWaitMs(headers({ 'retry-after-ms': '250', 'retry-after': '9' })), 250);
+    assert.equal(serverWaitMs(headers({ 'retry-after': '1.5' })), 1500);
+    assert.equal(serverWaitMs(headers({})), null);
+});
+
+const sse = (...events) => [new TextEncoder().encode(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('') + 'data: [DONE]\n\n')];
+const delta = (d, finish) => ({ choices: [{ delta: d, ...(finish ? { finish_reason: finish } : {}) }] });
+
+test('tool-call deltas: matched by id, sparse pieces go to the latest call, the first name sticks', async () => {
+    const reply = await readStream(sse(
+        delta({ tool_calls: [{ id: 'a', function: { name: 'read_file', arguments: '' } }] }),
+        delta({ tool_calls: [{ function: { name: 'read_file', arguments: '{"path":' } }] }),
+        delta({ tool_calls: [{ function: { arguments: '"x"}' } }] }),
+        delta({ tool_calls: [{ id: 'b', function: { name: 'edit', arguments: '{}' } }] }),
+        delta({ tool_calls: [{ id: 'a', function: { arguments: '' } }] }),
+        delta({}, 'tool_calls')));
+    assert.deepEqual(reply.choices[0].message.tool_calls.map((c) => [c.id, c.function.name, c.function.arguments]),
+        [['a', 'read_file', '{"path":"x"}'], ['b', 'edit', '{}']]);
+    assert.deepEqual(uniqueIds(['x', '', 'x', 'call_1']), ['x', 'call_1', 'call_2', 'call_3']);
+});
+
+test('a finish reason other than stop, length or tool_calls is a cut stream', async () => {
+    await assert.rejects(readStream(sse(delta({ content: 'part' }, 'content_filter'))),
+        (err) => /finish_reason content_filter/.test(err.message) && !!err.retry);
+    const ok = await readStream(sse(delta({ content: 'all' }, 'length')));
+    assert.equal(ok.choices[0].finish_reason, 'length');
+});
+
+test('gateway 502 and 503 are retried, honouring retry-after-ms as the least wait', () => {
+    const { text, isError } = call({ prompt: 'hi' }, { env: { MOCK_FAIL_FIRST: JSON.stringify(['502',
+        { status: 503, code: 'upstream_unavailable', headers: { 'retry-after-ms': 300 } }]) } });
+    assert.equal(isError, false, text);
+    const t = times();
+    assert.equal(t.length, 3);
+    assert.ok(t[2] - t[1] >= 280, `gap ${t[2] - t[1]}`);
+});
+
+test('504 is retried at most twice and 500 once; x-should-retry: false is not retried', () => {
+    let r = call({ prompt: 'hi' }, { env: { MOCK_FAIL_FIRST: JSON.stringify(Array(5).fill('504')) } });
+    assert.equal(r.isError, true);
+    assert.match(r.text, /WarriorGPT 504 \(upstream_timeout\): .*Retry the request.*gave up after 3 tries/);
+    assert.equal(times().length, 3);
+    dir = mkdtempSync(join(tmpdir(), 'warriorgpt-retry-test-'));
+    r = call({ prompt: 'hi' }, { env: { MOCK_FAIL_FIRST: JSON.stringify(Array(5).fill('500')) } });
+    assert.match(r.text, /WarriorGPT 500 \(internal_error\).*gave up after 2 tries/);
+    assert.equal(times().length, 2);
+    dir = mkdtempSync(join(tmpdir(), 'warriorgpt-retry-test-'));
+    r = call({ prompt: 'hi' }, { env: { MOCK_FAIL_FIRST: JSON.stringify([{ status: 502, headers: { 'x-should-retry': 'false' } }]) } });
+    assert.equal(r.isError, true);
+    assert.equal(times().length, 1);
+});
+
+test('a connection reset mid-stream is retried from the start', () => {
+    const { text, isError } = call({ prompt: 'hi' }, { reply: 'the whole reply',
+        env: { MOCK_STREAM: '1', MOCK_FAIL_FIRST: JSON.stringify(['reset-mid']) } });
+    assert.equal(isError, false, text);
+    assert.match(text, /^the whole reply\n/);
+    assert.equal(times().length, 2);
+});
+
+test('no headers within the header timeout, or a stream gone quiet past the idle timeout, is retried', () => {
+    const env = { MOCK_STREAM: '1', WARRIORGPT_HEADER_TIMEOUT_MS: '200', WARRIORGPT_IDLE_TIMEOUT_MS: '200' };
+    const log = join(dir, 'run.log');
+    const { text, isError } = call({ prompt: 'hi', log_file: log }, { env: { ...env, MOCK_FAIL_FIRST: JSON.stringify(['hang', 'stall']) } });
+    assert.equal(isError, false, text);
+    assert.match(text, /^hello/);
+    assert.equal(times().length, 3);
+    const logged = readFileSync(log, 'utf8');
+    assert.match(logged, /no response within 0\.2 s; retry 1 of 5/);
+    assert.match(logged, /the stream stalled \(no data for 0\.2 s\); retry 2 of 5/);
+});
+
+test('timeouts share the 504 cap of two retries', () => {
+    const { text, isError } = call({ prompt: 'hi' }, { env: { MOCK_STREAM: '1', WARRIORGPT_IDLE_TIMEOUT_MS: '100',
+        MOCK_FAIL_FIRST: JSON.stringify(Array(5).fill('stall')) } });
+    assert.equal(isError, true);
+    assert.match(text, /no data for 0\.1 s.*gave up after 3 tries/);
+    assert.equal(times().length, 3);
 });
