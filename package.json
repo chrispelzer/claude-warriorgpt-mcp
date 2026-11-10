@@ -17,6 +17,7 @@
     "edits.mjs",
     "loop.mjs",
     "workspace.mjs",
+    "jobs.mjs",
     "limit.mjs",
     "retry.mjs",
     "warriorgpt-ask.mjs",

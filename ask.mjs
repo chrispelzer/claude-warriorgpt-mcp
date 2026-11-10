@@ -545,7 +545,9 @@ current contents above, not the versions in my first message. Change only what i
 
 // Returns { ok, text, attempts, usage, files, fallback? }; ok is false only when a check never passed (then
 // fallback is 'opencode'); every other problem throws: UsageError, ApiError, or Error for an unapplied reply.
-export async function runAsk(args) {
+// signal cancels the whole run: requests and checks stop, every file is restored, and it throws CancelledError.
+// onLog gets every line the log file would, log file or not.
+export async function runAsk(args, { signal: stop, onLog } = {}) {
     const key = apiKey();
     if (!key) throw new UsageError(missingKeyMessage());
     if (!args.prompt) throw new UsageError('prompt is required.');
@@ -606,6 +608,7 @@ export async function runAsk(args) {
     // Optional attempt log: every reply in full and every check's output, so a miss can be diagnosed later.
     const logFile = args.log_file ? resolve(args.log_file) : null;
     const log = (text) => {
+        onLog?.(text);
         if (!logFile) return;
         mkdirSync(dirname(logFile), { recursive: true });
         withLockRetry(() => appendFileSync(logFile, text.endsWith('\n') ? text : `${text}\n`));
@@ -653,7 +656,7 @@ export async function runAsk(args) {
     const loopNoThinking = () => loopThinking === 'off' || (loopThinking === 'auto' && runawaySeen);
     // state.base: the steps' thinking budget, raised for the loop lane or seeded from the race, back to base once a
     // step makes an edit; cut-offs double it up to the step's output limit less room for the tool call.
-    const loopChatFor = (state, { signal, say = log, base = loopThinkBudget } = {}) => async (msgs, { tools, maxTokens: limit, budgetScale = 1, thinkBudget: fixed = 0, deadline = 0 }) => {
+    const loopChatFor = (state, { signal = stop, say = log, base = loopThinkBudget } = {}) => async (msgs, { tools, maxTokens: limit, budgetScale = 1, thinkBudget: fixed = 0, deadline = 0 }) => {
         const room = state.base > base ? Math.max(limit, state.base + 4096) : limit;
         let reply;
         try {
@@ -681,7 +684,7 @@ export async function runAsk(args) {
     // in it, so the user turn holds the tool instructions, the files as they are now and the lead.
     const loopRun = (mode, lead, steps, history = null) => runLoop({
         chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...(args.context_files || []).map((p) => resolve(p))], cwd, mode,
-        runCheck: () => runCheck(check, cwd, checkTimeout), runNode: (code) => runNode(code, cwd), log,
+        runCheck: () => runCheck(check, cwd, checkTimeout, stop), runNode: (code) => runNode(code, cwd, stop), log,
         maxSteps: steps, maxTokens: mode === 'verify' ? LANE_MAX_TOKENS : loopMaxTokens, onRunaway: () => { runawaySeen = true; }, system: mode === 'verify' ? VERIFY_SYSTEM : FIX_SYSTEM,
         ...(history ? { history } : {}), verifyThink: VERIFY_THINK_BUDGET, verifyMs: verifyMs,
         user: history
@@ -692,6 +695,10 @@ export async function runAsk(args) {
                 `Working directory: ${cwd}\nCheck command: ${check}\n\n${lead}`,
     });
 
+    // A cancelled run stops at the next step; the catch below restores the files.
+    const stopped = () => {
+        if (stop?.aborted) throw new CancelledError('cancelled');
+    };
     const countReply = (reply) => {
         requests++;
         total.in += reply.usage.in;
@@ -717,7 +724,7 @@ export async function runAsk(args) {
             } catch (err) {
                 if (!(err instanceof CancelledError)) throw err;
                 if (err.usage) countReply({ usage: err.usage });
-                log(`--- ${tag} cancelled: another attempt passed${err.usage ? ` (~${err.usage.out} tokens generated)` : ''}`);
+                log(`--- ${tag} cancelled: ${stop?.aborted ? 'the run was cancelled' : 'another attempt passed'}${err.usage ? ` (~${err.usage.out} tokens generated)` : ''}`);
                 return { cancelled: true };
             }
             countReply(reply);
@@ -865,6 +872,12 @@ export async function runAsk(args) {
                 copy.cleanup().catch(() => {});
             }
         };
+        const onStop = () => {
+            ctls.forEach((c) => c.abort());
+            laneCtl.abort();
+        };
+        if (stop?.aborted) onStop();
+        stop?.addEventListener('abort', onStop, { once: true });
         const lanePromise = loopLane ? runLane().then((r) => {
             if (r.contents && winner === null) {
                 winner = 'loop';
@@ -879,6 +892,7 @@ export async function runAsk(args) {
             if (r.score !== 0) leaves(i);
             return r;
         }))), lanePromise]);
+        stop?.removeEventListener('abort', onStop);
         // Copies are removed in the background; nothing waits for it.
         copies.forEach((c) => c.then((x) => x.cleanup(), () => {}));
         const errors = results.filter((r) => r.apiError);
@@ -893,7 +907,9 @@ export async function runAsk(args) {
     let laneSelfCheck = null; // the lane's own self-check, when it won with verify on
     let shotHistory = null; // the winning one-shot attempt's conversation, ending with its reply (verify continues it)
     try {
+        stopped();
         const raced = loop && files.every((f) => inside(cwd, f)) ? await raceAttempts() : null;
+        stopped();
         if (loop && !raced) log('=== one first attempt');
         const laneDone = !!(raced?.lane && !raced.lane.cancelled);
         if (raced?.lane?.res) steps += raced.lane.res.steps;
@@ -907,7 +923,8 @@ export async function runAsk(args) {
                     withLockRetry(() => writeFileSync(f, buf));
                 }
             }
-            const ran = await runCheck(check, cwd, checkTimeout);
+            const ran = await runCheck(check, cwd, checkTimeout, stop);
+            stopped();
             log(`--- [loop] applied to the real files; check ${ran.ok ? 'passed' : `failed (exit ${ran.code})`} in ${ran.ms} ms`);
             if (ran.ok) {
                 laneSelfCheck = res.selfCheck || null;
@@ -937,7 +954,8 @@ export async function runAsk(args) {
             if (best?.plan && (won || !laneDone)) withLockRetry(() => writePlan(best.plan));
             if (won) {
                 // Confirm in the real tree: it differs from the copy in .git and anything the check leaves behind.
-                const ran = await runCheck(check, cwd, checkTimeout);
+                const ran = await runCheck(check, cwd, checkTimeout, stop);
+                stopped();
                 log(`--- [a${won.i + 1}] applied to the real files; check ${ran.ok ? 'passed' : `failed (exit ${ran.code})`} in ${ran.ms} ms`);
                 if (ran.ok) {
                     const r = won.reply.reasoningText?.trim();
@@ -964,7 +982,7 @@ export async function runAsk(args) {
             // A cut-off or runaway reply is reissued at most MAX_FREE_RETRIES times with a budget; after that the
             // request runs to max_tokens, so the call always gets a real reply.
             const reply = await chat(key, { model, messages, maxTokens, attempt: check ? attempt : 0, sampling,
-                thinkBudget: free < MAX_FREE_RETRIES ? thinkBudget : 0, noThinking: free > 0, say: log });
+                thinkBudget: free < MAX_FREE_RETRIES ? thinkBudget : 0, noThinking: free > 0, signal: stop, say: log });
             requests++;
             total.in += reply.usage.in;
             total.out += reply.usage.out;
@@ -1022,7 +1040,8 @@ export async function runAsk(args) {
             }
             if (!check) return done(summary, changedFiles());
 
-            const ran = await runCheck(check, cwd, checkTimeout);
+            const ran = await runCheck(check, cwd, checkTimeout, stop);
+            stopped();
             log(`--- attempt ${attempt}: check ${ran.ok ? 'passed' : ran.timedOut ? 'timed out' : `failed (exit ${ran.code})`}\n${tail(ran.output, 20000)}`);
             if (ran.ok) {
                 passed = { attempts: attempt, loop: false, head: `check passed on attempt ${attempt} of ${maxAttempts}: ${check}\n` +
@@ -1042,11 +1061,13 @@ export async function runAsk(args) {
             else if (lane.error) lastFailure = `${lastFailure ? `${lastFailure}\n` : ''}the loop lane stopped: ${lane.error.message}`;
             log('=== no lane passed: neither the one-shot attempts nor the loop lane');
         } else if (!passed && loop) {
+            stopped();
             log(`\n=== attempt 1 missed; switching to the tool loop (up to ${maxSteps} steps)`);
             const res = await loopRun('fix', `${attemptsMade > 1 ? `None of ${attemptsMade} one-shot attempts passed; the files hold the best one.`
                 : 'Your one-shot attempt did not pass.'} Last ${lastFailure}\n\n` +
                 'Find the cause and fix it with the tools until the check passes, then call done.', maxSteps);
             steps += res.steps;
+            stopped();
             if (res.passed) {
                 passed = { attempts: attemptsMade, loop: true, head: `check passed in the tool loop at step ${res.steps} of ${maxSteps} ` +
                     `(${attemptsMade > 1 ? `${attemptsMade} parallel attempts` : 'attempt 1'} missed): ${check}${res.summary ? `\n${res.summary}` : ''}` };
@@ -1104,6 +1125,11 @@ export async function runAsk(args) {
         const res = await loopRun('verify', 'The check passes with the files above. Test the rules of the task and its spec ' +
             'that the tests miss, as your instructions say, fix what breaks them, then call done.', cap, shotHistory)
             .catch((err) => ({ finished: false, steps: 0, edits: 0, error: err.message }));
+        if (stop?.aborted) {
+            restore();
+            log('=== cancelled during the self-check; every file restored');
+            throw new CancelledError('cancelled');
+        }
         steps += res.steps;
         const said = res.summary ? `: ${res.summary}` : '';
         const nEdits = `${res.edits} edit${res.edits === 1 ? '' : 's'}`;

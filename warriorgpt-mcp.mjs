@@ -3,8 +3,11 @@
 // session can hand text generation to WarriorGPT without going through opencode.
 
 import { createInterface } from 'node:readline';
+import { parseArgs } from 'node:util';
 import { DEFAULT_MODEL } from './common.mjs';
-import { MODELS, runAsk } from './ask.mjs';
+import { MODELS, runAsk, UsageError } from './ask.mjs';
+import { createJobs } from './jobs.mjs';
+import { setMaxConcurrency } from './limit.mjs';
 
 const TOOL = {
     name: 'ask_warriorgpt',
@@ -21,8 +24,9 @@ const TOOL = {
         'restored and the result says fallback: opencode, meaning hand the task to a full coding agent. ' +
         'With verify, structuredContent carries verified: true when the self-check finished, false when it ran out ' +
         'of steps; either way the files pass the check. ' +
-        'This call blocks until it finishes; for checked or multi-attempt tasks, run the warriorgpt-ask ' +
-        'CLI with Bash in the background instead. Review what it wrote.',
+        'This call blocks until it finishes, and a checked task runs for minutes, longer than a tool call may wait: ' +
+        'for anything with check, use start_warriorgpt_job instead (same arguments) and poll it. Use this tool ' +
+        'for quick calls without check. Review what it wrote.',
     inputSchema: {
         type: 'object',
         properties: {
@@ -78,6 +82,142 @@ const TOOL = {
     },
 };
 
+const MAX_WAIT_S = 30;
+const jobId = { type: 'string', description: 'The job_id that start_warriorgpt_job returned.' };
+const waitS = { type: 'integer', description: `Wait up to this many seconds for the job to finish before answering (default 0, max ${MAX_WAIT_S}). Answers as soon as it finishes.` };
+const JOB_TOOLS = [
+    {
+        name: 'start_warriorgpt_job',
+        description:
+            'Start an ask_warriorgpt task in the background and return its job_id at once; takes the same arguments ' +
+            'as ask_warriorgpt. Use it for anything with check: a checked task runs for minutes (one-shot attempts, ' +
+            'the tool loop, the check, retries), longer than one tool call may wait. Then call ' +
+            'get_warriorgpt_job_status about every 30 s (15 s in the first minute, 60 s after five; or pass wait_s to ' +
+            'wait in the call), and do other work in between. When the state is done, failed or cancelled, call ' +
+            'get_warriorgpt_job_result. Jobs live in this server process: they end if it restarts, and finished ' +
+            'results are kept for an hour. A few run at once; the rest queue.',
+        inputSchema: TOOL.inputSchema,
+    },
+    {
+        name: 'get_warriorgpt_job_status',
+        description:
+            'State of a WarriorGPT job: queued, running, cancelling, done, failed or cancelled, with the time elapsed, ' +
+            'progress (one-shot replies, the latest tool-loop step, request retries) and its last log lines. Without ' +
+            'job_id, lists every job. Poll no more than about every 30 s (next_poll_s says when); the job does not ' +
+            'move faster for it. Once it is done, failed or cancelled, get_warriorgpt_job_result has the outcome.',
+        inputSchema: { type: 'object', properties: { job_id: jobId, wait_s: waitS,
+            log_lines: { type: 'integer', description: 'Log lines to include (default 15, max 100).' } } },
+    },
+    {
+        name: 'get_warriorgpt_job_result',
+        description:
+            'The result of a finished WarriorGPT job, exactly as ask_warriorgpt would have returned it (text, isError, ' +
+            'and structuredContent with ok, fallback and attempts when the check never passed). A job that has not ' +
+            'finished yet answers with its state instead; poll get_warriorgpt_job_status until it has.',
+        inputSchema: { type: 'object', properties: { job_id: jobId, wait_s: waitS }, required: ['job_id'] },
+    },
+    {
+        name: 'cancel_warriorgpt_job',
+        description:
+            'Cancel a WarriorGPT job: its requests and checks stop and every file it may change is put back as it ' +
+            'was. A queued job is dropped at once; a running one takes a moment to stop (the state goes cancelling, ' +
+            'then cancelled).',
+        inputSchema: { type: 'object', properties: { job_id: jobId }, required: ['job_id'] },
+    },
+];
+
+// ask_warriorgpt's reply for a finished run, or for the error it threw; job results use the same shape.
+function toolResult(res) {
+    const content = [{ type: 'text', text: res.text }];
+    // verified false: the check passes, but the self-check did not finish.
+    if (res.ok && res.verified !== undefined) {
+        return { content, structuredContent: { ok: true, verified: res.verified,
+            ...(res.fallback ? { fallback: res.fallback } : {}), attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}) } };
+    }
+    if (res.ok) return { content };
+    // No attempt passed the check: say so in a form a client can branch on.
+    return { content, isError: true,
+        structuredContent: { ok: false, fallback: res.fallback, attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}) } };
+}
+const errorResult = (err) => ({ content: [{ type: 'text', text: err.message }], isError: true });
+
+const jobs = createJobs({ run: (args, ctx) => runAsk(args, ctx) });
+const FINISHED = new Set(['done', 'failed', 'cancelled']);
+const seconds = (ms) => Math.round(ms / 1000);
+const clock = (ms) => {
+    const s = seconds(ms);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+};
+// Polling more often does not make a job faster: early on it may finish soon, later it rarely does.
+const nextPoll = (job) => (FINISHED.has(job.state) ? 0 : jobs.elapsedMs(job) < 60_000 ? 15 : jobs.elapsedMs(job) < 300_000 ? 30 : 60);
+const waitFor = (job, args) => jobs.wait(job, Math.min(Math.max(Number(args?.wait_s) || 0, 0), MAX_WAIT_S) * 1000);
+const findJob = (args) => {
+    const job = args?.job_id ? jobs.get(String(args.job_id)) : null;
+    if (!job) throw new UsageError(`No job ${args?.job_id ?? '(job_id missing)'}: it never existed, or finished over an hour ago, or this server restarted.`);
+    return job;
+};
+
+function progressText(p) {
+    return [p.replies && `${p.replies} one-shot repl${p.replies === 1 ? 'y' : 'ies'}`, p.step,
+        p.retries && `${p.retries} request retr${p.retries === 1 ? 'y' : 'ies'}`].filter(Boolean).join(', ') || 'starting';
+}
+function statusOf(job, logLines = 15) {
+    const tail = logLines > 0 ? job.log.slice(-logLines) : [];
+    const task = String(job.args.prompt || '').replace(/\s+/g, ' ').slice(0, 100);
+    const poll = nextPoll(job);
+    const text = [`job ${job.id}: ${job.state}, ${clock(jobs.elapsedMs(job))}${job.state === 'queued' ? ' waiting' : ''}`,
+        `progress: ${progressText(job.progress)}`,
+        `task: ${task}${job.args.check ? ` | check: ${job.args.check}` : ''}`,
+        ...(tail.length ? ['last log lines:', ...tail.map((l) => `  ${l}`)] : []),
+        FINISHED.has(job.state) ? 'Finished: call get_warriorgpt_job_result for the outcome.'
+            : `Still going: check again in about ${poll} s.`].join('\n');
+    return { text, structured: { job_id: job.id, state: job.state, elapsed_s: seconds(jobs.elapsedMs(job)),
+        progress: { ...job.progress }, ...(poll ? { next_poll_s: poll } : {}), log_tail: tail } };
+}
+
+async function callJobTool(name, args) {
+    if (name === 'start_warriorgpt_job') {
+        const job = jobs.start(args || {});
+        // Bad arguments fail before the run does any work: report them now rather than on the first poll.
+        await new Promise((done) => setImmediate(done));
+        if (job.state === 'failed' && job.error instanceof UsageError) return errorResult(job.error);
+        const ahead = job.state === 'queued' ? `; ${jobs.stats().waiting} queued, ${jobs.stats().running} running` : '';
+        return { content: [{ type: 'text', text: `Started job ${job.id} (${job.state}${ahead}). Call get_warriorgpt_job_status ` +
+            'with this job_id in about 15 s, then about every 30 s, doing other work in between; when it is done, failed ' +
+            'or cancelled, call get_warriorgpt_job_result.' }], structuredContent: { job_id: job.id, state: job.state } };
+    }
+    if (name === 'get_warriorgpt_job_status') {
+        const n = Math.min(Math.max(args?.log_lines === undefined ? 15 : Number(args.log_lines) || 0, 0), 100);
+        if (!args?.job_id) {
+            const all = jobs.list().map((j) => statusOf(j, 0));
+            return { content: [{ type: 'text', text: all.length ? all.map((s) => s.text.split('\n').slice(0, 2).join('; ')).join('\n')
+                : 'No jobs.' }], structuredContent: { jobs: all.map((s) => s.structured) } };
+        }
+        const job = findJob(args);
+        await waitFor(job, args);
+        const { text, structured } = statusOf(job, n);
+        return { content: [{ type: 'text', text }], structuredContent: structured };
+    }
+    if (name === 'get_warriorgpt_job_result') {
+        const job = findJob(args);
+        await waitFor(job, args);
+        if (job.state === 'done') return toolResult(job.result);
+        if (job.state === 'failed') return errorResult(job.error);
+        if (job.state === 'cancelled') {
+            return { content: [{ type: 'text', text: `Job ${job.id} was cancelled; every file it could change is back as it was.` }], isError: true };
+        }
+        const { text, structured } = statusOf(job, 5);
+        return { content: [{ type: 'text', text: `Not finished yet. ${text}` }], structuredContent: structured };
+    }
+    // cancel_warriorgpt_job
+    const job = findJob(args);
+    jobs.cancel(job);
+    // Give the run a moment to unwind and restore the files, so the answer is usually final.
+    await jobs.wait(job, 5000);
+    const { text, structured } = statusOf(job, 3);
+    return { content: [{ type: 'text', text }], structuredContent: structured };
+}
+
 function send(msg) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...msg }) + '\n');
 }
@@ -94,24 +234,20 @@ async function handle(req) {
         case 'ping':
             return send({ id, result: {} });
         case 'tools/list':
-            return send({ id, result: { tools: [TOOL] } });
+            return send({ id, result: { tools: [TOOL, ...JOB_TOOLS] } });
         case 'tools/call':
-            if (params?.name !== TOOL.name) return send({ id, error: { code: -32602, message: `Unknown tool ${params?.name}` } });
-            try {
-                const res = await runAsk(params.arguments || {});
-                const content = [{ type: 'text', text: res.text }];
-                // verified false: the check passes, but the self-check did not finish.
-                if (res.ok && res.verified !== undefined) {
-                    return send({ id, result: { content, structuredContent: { ok: true, verified: res.verified,
-                        ...(res.fallback ? { fallback: res.fallback } : {}), attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}) } } });
+            if (params?.name === TOOL.name) {
+                try {
+                    return send({ id, result: toolResult(await runAsk(params.arguments || {})) });
+                } catch (err) {
+                    return send({ id, result: errorResult(err) });
                 }
-                if (res.ok) return send({ id, result: { content } });
-                // No attempt passed the check: say so in a form a client can branch on.
-                return send({ id, result: { content, isError: true,
-                    structuredContent: { ok: false, fallback: res.fallback, attempts: res.attempts,
-                        ...(res.steps ? { steps: res.steps } : {}) } } });
+            }
+            if (!JOB_TOOLS.some((t) => t.name === params?.name)) return send({ id, error: { code: -32602, message: `Unknown tool ${params?.name}` } });
+            try {
+                return send({ id, result: await callJobTool(params.name, params.arguments) });
             } catch (err) {
-                return send({ id, result: { content: [{ type: 'text', text: err.message }], isError: true } });
+                return send({ id, result: errorResult(err) });
             }
         default:
             // Notifications (no id) need no reply.
@@ -119,7 +255,17 @@ async function handle(req) {
     }
 }
 
-createInterface({ input: process.stdin }).on('line', (line) => {
+try {
+    const { values } = parseArgs({ options: { 'max-concurrency': { type: 'string' } } });
+    if (values['max-concurrency'] !== undefined) setMaxConcurrency(values['max-concurrency']);
+} catch (err) {
+    process.stderr.write(`warriorgpt-mcp: ${err.message}\n`);
+    process.exit(2);
+}
+
+// The client is gone: nobody can read a job's result, so its runs stop and put the files back. A plain
+// ask_warriorgpt call still in flight finishes as before.
+createInterface({ input: process.stdin }).on('close', () => jobs.cancelAll()).on('line', (line) => {
     if (!line.trim()) return;
     let req;
     try {
