@@ -13,7 +13,7 @@ const NO_RETRY_CODES = new Set(['quota_exceeded', 'insufficient_quota']);
 // is the gateway's own failure, which a second try rarely fixes.
 export const KIND_CAPS = { timeout: 2, server: 1 };
 // The response waits on the gateway's own slot queue (up to 30 s) before headers, so this must be well above it.
-export const DEFAULT_HEADER_TIMEOUT_MS = 90_000;
+export const DEFAULT_HEADER_TIMEOUT_MS = 180_000;
 // No byte of the stream for this long: the connection is taken as dead (reasoning streams tokens steadily).
 export const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 

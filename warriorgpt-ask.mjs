@@ -18,19 +18,21 @@ const HELP = `Usage: warriorgpt-ask (--prompt-file <file> | --prompt <text>) [op
                          raced by the loop lane from the start; the first to pass wins (default 1, max 6)
   --no-loop-lane         with --check: no racing tool-loop lane; the one-shot attempts go first, then the
                          loop starts from their best (the old behaviour)
-  --max-steps <n>        with --check: tool-loop steps after a missed first attempt (default 30, max 40)
+  --max-steps <n>        with --check: tool-loop steps (default 30, max 40); raise it when a run ends out of steps
   --verify               with --check: after it passes, the model tests the spec rules the check does not
                          cover with its own node:assert snippets, and fixes genuine failures
   --no-loop              with --check: no tool loop; retry whole replies instead (--max-attempts)
   --max-attempts <n>     with --no-loop: attempts before giving up (default 3, max 5)
-  --check-timeout <s>    with --check: seconds before a run is killed (default 300)
+  --check-timeout <s>    with --check: seconds before a run is killed (default 300, max 3600); slow suites
+                         (PHP, a full pytest run) may need more
   --output-file <path>   write the reply to this one file instead (not with --files)
   --model <id>           WarriorGPT model (default local.qwen3.8-27b or WARRIORGPT_MODEL)
   --system-file <file>   a system prompt
   --max-tokens <n>       max output tokens for the first reply (default 16384)
   --loop-max-tokens <n>  max output tokens per tool-loop or verify step (default 8192)
   --think-budget <n>     edit tasks: cut a reply off once its thinking passes n tokens with nothing written,
-                         then ask for the edits with the analysis so far (default 4096; 0 = no budget)
+                         then ask for the edits with the analysis so far, doubling the budget on each retry
+                         up to 16384 (default 4096; 0 = no budget)
   --loop-think-budget <n> the same for tool-loop and verify steps (default 1536)
   --loop-thinking <mode> auto|on|off: ask the server to skip thinking in loop steps (auto: after a runaway)
   --temperature <t>      temperature for the first attempt (default 0.6 with Qwen's top_p/top_k/presence
@@ -45,8 +47,12 @@ With --check, the first attempt is one request with every file attached. If its 
 tools (read_file, edit, run_check, run_node: a JavaScript snippet run with this Node, no shell) and works
 until the check passes or the steps run out. If it never passes, every file is restored.
 
-Prints a short digest, then one JSON line: {ok, attempts, steps?, verified?, files, tokens, ms} (plus fallback
-when --check never passed). verified is false when the --verify self-check did not finish; the files still pass
+Prints a short digest, then one JSON line: {ok, attempts, steps?, verified?, files, tokens, warnings?, ms} (plus
+fallback when --check never passed). warnings: problems that are probably not the model's code, such as a check
+that tests the real tree instead of the copy, or one that fails the same way whatever the edits.
+
+Jobs pass fastest when the acceptance tests are written first and passed as --check, and a big change is split
+into small tasks, each naming its --files and --context. Review the diff: a passing check is not a review. verified is false when the --verify self-check did not finish; the files still pass
 the check (self-check edits that broke it are undone).
 Exit codes: 0 done (check passed); 1 failed (a reply that could not be applied, no --check); 2 usage;
 3 WarriorGPT unreachable or refused; 4 --check never passed, every file restored: hand the task to an agent
@@ -141,7 +147,7 @@ async function main() {
     if (!opts.json) console.log(res.text);
     console.log(JSON.stringify({ ok: res.ok, attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}),
         ...(res.verified !== undefined ? { verified: res.verified } : {}), files: res.files, tokens: res.usage,
-        ...(res.fallback ? { fallback: res.fallback } : {}), ms: Date.now() - started }));
+        ...(res.fallback ? { fallback: res.fallback } : {}), ...(res.warnings ? { warnings: res.warnings } : {}), ms: Date.now() - started }));
     return !res.ok ? 4 : 0;
 }
 

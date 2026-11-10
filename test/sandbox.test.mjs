@@ -62,3 +62,31 @@ catch (e) { console.log('outside', e.code); }`);
         rmSync(root, { recursive: true, force: true });
     }
 });
+
+test('a snippet can import a package hoisted to a node_modules above the tree, and read attached files, but nothing else', () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'wgpt-sandbox-')));
+    const tree = join(root, 'packages', 'app');
+    mkdirSync(tree, { recursive: true });
+    mkdirSync(join(root, 'node_modules', 'hoisted'), { recursive: true });
+    writeFileSync(join(root, 'node_modules', 'hoisted', 'package.json'), '{"name":"hoisted","main":"index.js"}');
+    writeFileSync(join(root, 'node_modules', 'hoisted', 'index.js'), 'module.exports = 7;\n');
+    writeFileSync(join(root, 'spec.md'), 'the spec\n');
+    writeFileSync(join(root, 'private.txt'), 'not for snippets\n');
+    try {
+        const args = runNodeArgs(tree, [join(root, 'spec.md')]);
+        assert.ok(args.includes(`--allow-fs-read=${join(root, 'node_modules')}`), 'the hoisted node_modules is readable');
+        assert.deepEqual(args.filter((a) => a.startsWith('--allow-fs-write')), [`--allow-fs-write=${tree}`], 'still writes only in the tree');
+        const out = snippet(tree, `
+import h from 'hoisted';
+import { readFileSync } from 'node:fs';
+console.log('hoisted', h);
+console.log('spec', readFileSync(${JSON.stringify(join(root, 'spec.md'))}, 'utf8').trim());
+try { readFileSync(${JSON.stringify(join(root, 'private.txt'))}); console.log('private allowed'); }
+catch (e) { console.log('private', e.code); }`, [join(root, 'spec.md')]);
+        assert.match(out, /hoisted 7/);
+        assert.match(out, /spec the spec/);
+        assert.match(out, /private ERR_ACCESS_DENIED/);
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});

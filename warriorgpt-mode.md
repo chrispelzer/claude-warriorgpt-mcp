@@ -77,6 +77,16 @@ undone if they broke the check). `fallback: opencode` in the result, or exit 4,
 means the check never passed and every file is back as it was: do not retry the same call, hand the task to `warrior-coder`
 (below), which can run the tests and read around the code.
 
+What makes checked jobs pass: write the acceptance tests first and pass
+them as `check`; split a big module into small tasks, each naming its
+`files` and `context_files`. A result with a `warning:` line (the check
+tests the real tree, or fails the same way whatever the edits, or the
+thinking budget ran out) needs the setup fixed, not a retry. If a run ends
+out of steps or its check timed out, raise `max_steps` (`--max-steps`, up
+to 40) or `check_timeout_s` (`--check-timeout`). Review the diff: a passing
+check is not a review. Passing jobs have still shipped wrong units, deleted
+while iterating, leaked file handles and failed the type checker.
+
 Pick `model` per task: `local.qwen3.8-27b` (the default) for writing code,
 `local.gpt-oss-120b` when the task needs more reasoning, `local.gemma-4-31b`
 if those are down.

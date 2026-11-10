@@ -6,6 +6,7 @@
 // (finish_reason tool_calls unless MOCK_FINISH_LIST says otherwise); streamed as tool-call deltas.
 // An object reply may also set finish, out (completion tokens), reasoning (reasoning tokens), and
 // reasoning_text (streamed as reasoning deltas before any content).
+// MOCK_ERROR_BODY is the body of a MOCK_STATUS error reply (default "mock error").
 // MOCK_REJECT_KWARGS answers any request carrying chat_template_kwargs with a 400, as a strict server would.
 // MOCK_ROUTES (a JSON file {"substring": [replies]}) answers a request whose body contains the substring from
 // that list instead (each route keeps its own place, repeating its last reply). delay_ms on an object reply
@@ -187,7 +188,7 @@ globalThis.fetch = async (url, init) => {
     return {
         ok: status < 400,
         status,
-        text: async () => 'mock error',
+        text: async () => process.env.MOCK_ERROR_BODY || 'mock error',
         // Read lazily: some callers (the delegate probe) never set a reply and never read the body.
         json: async () => { const reply = asObject(pick(n)); return {
             usage: usageOf(reply),

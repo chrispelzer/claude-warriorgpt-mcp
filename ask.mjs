@@ -1,10 +1,10 @@
 // The ask_warriorgpt core, shared by the MCP server and the warriorgpt-ask CLI.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
 import { dirname, resolve, join, sep } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
-import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS } from './loop.mjs';
-import { makeCopy, inside, CantCopyError } from './workspace.mjs';
+import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow } from './loop.mjs';
+import { makeCopy, inside, CantCopyError, copyEnv, probeCopy, sameFailure } from './workspace.mjs';
 import { availableParallelism } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
@@ -72,7 +72,6 @@ const MAX_FREE_RETRIES = 2;
 export const FALLBACK_HINT = 'fallback: opencode. Hand this task to an agent that can run the tests and read the code ' +
     '(for example warriorgpt-delegate, or your OpenCode subagent).';
 export const MAX_TEMPERATURE = 0.8;
-const CHECK_OUTPUT_CHARS = 4000;
 // The loop lane is the main path on hard tasks; OpenCode has no step cap, and lower caps made lanes give up too early.
 const DEFAULT_STEPS = 30;
 const MAX_STEPS = 40;
@@ -81,10 +80,14 @@ const VERIFY_STEPS = 8;
 // Parallel first attempts: vLLM batches them, so several cost about the time of one. Default to one: on hard tasks
 // the cut-off one-shot attempts lost every time to the always-on, uncut tool-loop lane.
 export const DEFAULT_PARALLEL = 1;
-// A race attempt still thinking past its budget after one reissue is dropped: such attempts never wrote anything.
-const RACE_FREE_RETRIES = 1;
-// The portfolio race: thinking budgets of 1x, 3x and 5x think_budget, each cut off once and reissued with a short
-// budget, then dropped. Output caps are budget + max_tokens, at most RACE_MAX_TOKENS, so no attempt stalls the race.
+// A race attempt cut off at its thinking budget is reissued with its analysis and twice the budget (up to
+// MAX_THINK_BUDGET), at most this often, then dropped as out of thinking budget: such attempts never wrote anything.
+const RACE_FREE_RETRIES = 2;
+const MAX_THINK_BUDGET = 16384;
+// Output room left for writing the edits after a raised thinking budget.
+const WRITE_ROOM = 8192;
+// The portfolio race: thinking budgets of 1x, 3x and 5x think_budget, each cut off and reissued with a doubled base
+// budget (RACE_FREE_RETRIES), then dropped. Output caps are budget + max_tokens, at most RACE_MAX_TOKENS, so no attempt stalls the race.
 const PORTFOLIO_SCALES = [1, 3, 5];
 const RACE_MAX_TOKENS = 32768;
 // The loop lane's output cap per step: with a bigger cap a step could think for minutes before its first tool call.
@@ -455,13 +458,13 @@ function killTree(child) {
 
 // Runs a process and collects its output. stdin is closed unless input is given: on the MCP server our own
 // stdin is the JSON-RPC stream. signal kills it early; the result carries ms, spawn to exit.
-function runProcess(command, args, { cwd, timeoutS, shell = false, input, signal }) {
+function runProcess(command, args, { cwd, timeoutS, shell = false, input, signal, env: extra = {} }) {
     return new Promise((done) => {
         // Cancelled while it waited for a check slot or a tree copy: a listener added now would never fire.
         if (signal?.aborted) return done({ ok: false, code: null, timedOut: false, cancelled: true, output: '', ms: 0 });
         const t0 = performance.now();
         // The key stays out of the child: a model-written snippet could otherwise print it into the log.
-        const env = { ...process.env };
+        const env = { ...process.env, ...extra };
         delete env.WARRIORGPT_API_KEY;
         const child = spawn(command, args, { cwd, shell, windowsHide: true, env,
             stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
@@ -514,10 +517,11 @@ export function splitCommand(command, platform = process.platform, execPath = pr
     return argv;
 }
 
-const runCheck = (command, cwd, timeoutS, signal) => {
+// env: extra variables, such as a copy's PYTHONPATH.
+const runCheck = (command, cwd, timeoutS, signal, env) => {
     const argv = splitCommand(command);
-    return argv ? runProcess(argv[0], argv.slice(1), { cwd, timeoutS, signal })
-        : runProcess(command, [], { cwd, timeoutS, shell: true, signal });
+    return argv ? runProcess(argv[0], argv.slice(1), { cwd, timeoutS, signal, env })
+        : runProcess(command, [], { cwd, timeoutS, shell: true, signal, env });
 };
 
 // A model-written snippet: this same Node binary, no shell, the source on stdin as an ES module. Node's permission
@@ -534,8 +538,20 @@ const withReal = (d) => {
     try { real = realpathSync(d); } catch { /* missing: allow it as given */ }
     return real === d ? [d] : [d, real];
 };
+// node_modules folders above a tree (a monorepo's hoisted packages): a bare import resolves through them.
+export function nodeModulesAbove(dir) {
+    const found = [];
+    for (let d = dirname(dir); ; d = dirname(d)) {
+        if (existsSync(join(d, 'node_modules'))) found.push(join(d, 'node_modules'));
+        if (d === dirname(d)) return found;
+    }
+}
+// Reads: the working directory, the readOnly paths (the original tree for a copy, attached files) and the
+// node_modules folders above them. Writes: the working directory only.
 export function runNodeArgs(cwd, readOnly = []) {
-    const reads = [...new Set([cwd, ...readOnly].filter(Boolean).flatMap(withReal))];
+    const roots = [cwd, ...readOnly].filter(Boolean);
+    const dirs = roots.filter((d) => { try { return statSync(d).isDirectory(); } catch { return false; } });
+    const reads = [...new Set([...roots, ...dirs.flatMap(nodeModulesAbove)].flatMap(withReal))];
     return [PERMISSION_FLAG, ...reads.map((d) => `--allow-fs-read=${d}`), ...withReal(cwd).map((d) => `--allow-fs-write=${d}`),
         '--input-type=module', '-'];
 }
@@ -688,6 +704,21 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         messages.push({ role: 'assistant', content: replyText }, { role: 'user', content: retryPrompt(check, failure, current()) });
     };
     let lastFailure = '';
+    // Every check run on the model's edits (not the confirming run in the real tree), and warnings for the result.
+    const checkRuns = [];
+    const noteCheck = (ran) => {
+        if (!ran.cancelled) checkRuns.push(ran);
+        return ran;
+    };
+    const warnings = [];
+    const warn = (text) => {
+        warnings.push(text);
+        log(`!!! WARNING: ${text}`);
+    };
+    const contextPaths = (args.context_files || []).map((p) => resolve(p));
+    // A one-shot request over the context window will not fit on a retry either: stop with what to change.
+    const tooBig = (err) => (isContextOverflow(err) ? new UsageError(`The request is over ${model}'s context window; attach ` +
+        `fewer or smaller context_files, list fewer files, or split the task. (${err.message.slice(0, 300)})`) : err);
 
     const changedFiles = () => {
         const changed = [];
@@ -734,8 +765,8 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     // history: continue that conversation (a winning one-shot attempt's) instead of starting one; the task is already
     // in it, so the user turn holds the tool instructions, the files as they are now and the lead.
     const loopRun = (mode, lead, steps, history = null) => runLoop({
-        chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...(args.context_files || []).map((p) => resolve(p))], cwd, mode,
-        runCheck: () => runCheck(check, cwd, checkTimeout, stop), runNode: (code) => runNode(code, cwd, stop), log,
+        chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...contextPaths], cwd, mode,
+        runCheck: () => runCheck(check, cwd, checkTimeout, stop).then(noteCheck), runNode: (code) => runNode(code, cwd, stop, contextPaths), log,
         maxSteps: steps, maxTokens: mode === 'verify' ? LANE_MAX_TOKENS : loopMaxTokens, onRunaway: () => { runawaySeen = true; }, system: mode === 'verify' ? VERIFY_SYSTEM : FIX_SYSTEM,
         ...(history ? { history } : {}), verifyThink: VERIFY_THINK_BUDGET, verifyMs: verifyMs,
         user: history
@@ -764,16 +795,20 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         const sampling = samplingFor(model, temp);
         let free = 0;
         let thought = 0; // reasoning tokens across its tries
+        let analysis = '';
+        // Budgeted on every try: an attempt that keeps thinking past it is dropped as a miss, since an unbudgeted try
+        // can stall the race. Each reissue after a cut-off doubles the base budget, with room left to write.
+        const budgetOf = (n) => (n ? Math.min(Math.min(budget, thinkBudget) * 2 ** n, MAX_THINK_BUDGET) : budget);
+        const capOf = (n) => (n ? Math.min(Math.max(cap, budgetOf(n) + WRITE_ROOM), Math.max(cap, RACE_MAX_TOKENS)) : cap);
         for (;;) {
             let reply;
             try {
-                // Budgeted on every try: an attempt that keeps thinking past it is dropped as a miss, since an unbudgeted try can stall the race.
-                // A reissue after a cut-off only has to write, so it gets the short budget; the wrap cuts one request, not the reissue after it.
-                reply = await chat(key, { model, messages: msgs, maxTokens: cap, attempt: 1, sampling,
-                    thinkBudget: free ? Math.min(budget, thinkBudget) : budget, noThinking: free > 0, signal, say: (t) => log(t.replace('--- ', `--- ${tag} `)),
+                // The wrap cuts one request, not the reissue after it.
+                reply = await chat(key, { model, messages: msgs, maxTokens: capOf(free), attempt: 1, sampling,
+                    thinkBudget: budgetOf(free), noThinking: free > 0, signal, say: (t) => log(t.replace('--- ', `--- ${tag} `)),
                     wrap: wrap?.aborted ? undefined : wrap });
             } catch (err) {
-                if (!(err instanceof CancelledError)) throw err;
+                if (!(err instanceof CancelledError)) throw tooBig(err);
                 if (err.usage) countReply({ usage: err.usage });
                 log(`--- ${tag} cancelled: ${stop?.aborted ? 'the run was cancelled' : 'another attempt passed'}${err.usage ? ` (~${err.usage.out} tokens generated)` : ''}`);
                 return { cancelled: true };
@@ -785,14 +820,19 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             log(`    timing: ${timingText(reply.timing)}`);
             if (reply.finish === 'think_budget') {
                 runawaySeen = true;
-                const why = wrap?.aborted ? 'the other attempts are out: cut off' : `thinking passed the ${free ? Math.min(budget, thinkBudget) : budget}-token budget`;
+                const why = wrap?.aborted ? 'the other attempts are out: cut off' : `thinking passed the ${budgetOf(free)}-token budget`;
                 if (free >= RACE_FREE_RETRIES) {
-                    log(`--- ${tag} ${why} with nothing written again; dropped`);
-                    return { reply, thought, error: 'kept thinking past its budget; nothing written.' };
+                    log(`--- ${tag} ${why} with nothing written again; dropped: out of thinking budget`);
+                    return { reply, thought, kind: 'think_budget',
+                        error: `ran out of thinking budget (${budgetOf(free)} tokens on its last try) before writing any file; nothing written.` };
                 }
                 free++;
-                log(`--- ${tag} ${why} with nothing written; reissued to write its edits now (free retry ${free} of ${RACE_FREE_RETRIES})`);
-                msgs.push({ role: 'user', content: budgetPrompt(reply.reasoningText, true) });
+                log(`--- ${tag} ${why} with nothing written; reissued to write its edits now, budget raised to ${budgetOf(free)} tokens ` +
+                    `(free retry ${free} of ${RACE_FREE_RETRIES})`);
+                // One budget prompt at a time, carrying the analysis of every try so far.
+                analysis = analysis ? `${analysis}\n${reply.reasoningText}` : reply.reasoningText;
+                msgs.splice(base);
+                msgs.push({ role: 'user', content: budgetPrompt(analysis, true) });
                 continue;
             }
             // No runaway retries in the race: an attempt that spent its output on thinking (cut off, or a normal stop
@@ -800,7 +840,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             if (isRunaway(reply, true, cap)) {
                 runawaySeen = true;
                 log(`--- ${tag} runaway thinking (${reply.usage.reasoning} tokens, nothing usable); dropped`);
-                return { reply, thought, error: 'spent its output on thinking; nothing written.' };
+                return { reply, thought, kind: 'think_budget', error: 'spent its output on thinking; nothing written.' };
             }
             if (reply.finish === 'length') return { reply, thought, error: 'reply was cut off at max_tokens; nothing written.' };
             try {
@@ -830,6 +870,9 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             log(`=== parallel attempts off: ${err.message}; one attempt`);
             return null;
         }
+        // Before the first check in a copy: does the code under test resolve outside it? The checks wait for this.
+        const probed = probeCopy({ root: cwd, dir: first.dir, files, check: checkIn(first.dir), env: copyEnv(first.dir) })
+            .then((found) => found.forEach(warn), () => {});
         const budgets = temps.map((_, i) => thinkBudget * PORTFOLIO_SCALES[i % PORTFOLIO_SCALES.length]);
         const caps = budgets.map((b) => (!thinkBudget || b === thinkBudget ? maxTokens : Math.max(maxTokens, Math.min(b + maxTokens, RACE_MAX_TOKENS))));
         log(`\n=== ${parallel} parallel first attempt${parallel === 1 ? '' : 's'} (temperatures ${temps.join(', ')}; thinking budgets ` +
@@ -868,7 +911,8 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             if (!shot.plan) return { i, temp: temps[i], ...shot, score: 1e9 };
             const copy = await copies[i];
             withLockRetry(() => writePlan(shot.plan, copy.to));
-            const ran = await checks(() => runCheck(checkIn(copy.dir), copy.dir, checkTimeout, ctls[i].signal));
+            const ran = await checks(() => probed.then(() => runCheck(checkIn(copy.dir), copy.dir, checkTimeout, ctls[i].signal,
+                copyEnv(copy.dir)))).then(noteCheck);
             if (ran.cancelled) return { i, temp: temps[i], ...shot, cancelled: true, score: 1e9 };
             log(`--- ${tag} check ${ran.ok ? 'passed' : ran.timedOut ? 'timed out' : `failed (exit ${ran.code})`} in ${ran.ms} ms ` +
                 `(in a copy of the tree)\n${tail(ran.output, 20000)}`);
@@ -902,8 +946,9 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                     chat: loopChatFor({ base: 0 }, { signal, say, base: 0 }), files: laneFiles,
                     readable: seen, cwd: copy.dir, mode: 'fix', log: say, maxSteps, maxTokens: LANE_MAX_TOKENS,
                     ...(verify ? { selfCheck: { steps: Math.min(maxSteps, VERIFY_STEPS) }, verifyThink: VERIFY_THINK_BUDGET, verifyMs } : {}),
-                    runCheck: () => checks(() => runCheck(laneCheck, copy.dir, checkTimeout, signal)),
-                    runNode: (code) => runNode(code, copy.dir, signal, [cwd]), onRunaway: () => { runawaySeen = true; }, system: FIX_SYSTEM,
+                    runCheck: () => checks(() => probed.then(() => runCheck(laneCheck, copy.dir, checkTimeout, signal, copyEnv(copy.dir))))
+                        .then(noteCheck),
+                    runNode: (code) => runNode(code, copy.dir, signal, [cwd, ...contextPaths]), onRunaway: () => { runawaySeen = true; }, system: FIX_SYSTEM,
                     user: `${args.prompt}${contextText}\n\nFiles you may change, as they are now:${now}\n\nWorking directory: ${copy.dir}\n` +
                         `Check command: ${laneCheck}\n\nMake the change with the tools: read what you need, edit, run the check, ` +
                         'and call done when it passes.',
@@ -943,6 +988,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             if (r.score !== 0) leaves(i);
             return r;
         }))), lanePromise]);
+        await probed;
         stop?.removeEventListener('abort', onStop);
         // Copies are removed in the background; nothing waits for it.
         copies.forEach((c) => c.then((x) => x.cleanup(), () => {}));
@@ -952,6 +998,10 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     };
 
     let free = 0;
+    // Attempts that never wrote anything because they spent their thinking budget (or all their output) thinking.
+    let outOfThinking = [];
+    let outOfSteps = false;
+    const budgetAt = (n) => Math.min(thinkBudget * 2 ** n, Math.max(thinkBudget, MAX_THINK_BUDGET));
     let steps = 0;
     let passed = null;
     let attemptsMade = maxAttempts;
@@ -983,10 +1033,11 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                 passed = { attempts: attemptsMade, loop: true, head: `check passed in the tool loop at step ${fixSteps} of ${maxSteps}, ` +
                     `racing ${attemptsMade} one-shot attempt${attemptsMade === 1 ? '' : 's'} from the start: ${check}${res.summary ? `\n${res.summary}` : ''}` };
             } else {
-                lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${tail(ran.output, CHECK_OUTPUT_CHARS)}`;
+                lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${headTail(ran.output)}`;
             }
         } else if (raced) {
             attemptsMade = raced.results.length;
+            outOfThinking = raced.results.filter((r) => r.kind === 'think_budget' && !r.cancelled).map((r) => `attempt ${r.i + 1}`);
             const won = raced.winner !== null ? raced.results[raced.winner] : null;
             // No winner: the closest attempt seeds the loop, the one that thought longest breaking ties; the loop's first
             // step then gets a thinking budget near what the longest thinker used.
@@ -995,7 +1046,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             if (!won) {
                 // What an attempt that finished its thinking (and wrote edits) used; if none did, the most any spent.
                 const finished = live.filter((r) => r.plan);
-                const need = Math.max(0, ...(finished.length ? finished : live).map((r) => r.thought || 0));
+                const need = Math.min(Math.max(0, ...(finished.length ? finished : live).map((r) => r.thought || 0)), MAX_THINK_BUDGET);
                 if (loopThinkBudget && need > loopThinkBudget) {
                     seqLoop.base = need;
                     log(`=== the loop's first step gets a ${need}-token thinking budget (what the longest-thinking attempt used)`);
@@ -1015,14 +1066,14 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                     passed = { attempts: attemptsMade, loop: false, head: `check passed on parallel attempt ${won.i + 1} of ` +
                         `${attemptsMade} (temperature ${won.temp}): ${check}\n${won.summary}` };
                 } else {
-                    lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${tail(ran.output, CHECK_OUTPUT_CHARS)}`;
+                    lastFailure = `check failed (exit ${ran.code}) in the real tree, though it passed in a copy:\n${headTail(ran.output)}`;
                 }
             } else if (best?.ran) {
                 const why = best.ran.timedOut ? `timed out after ${checkTimeout}s` : `failed (exit ${best.ran.code})`;
                 log(laneDone
                     ? `=== no parallel attempt passed and the loop lane is out of steps; [a${best.i + 1}] was closest (${best.score < 1e6 ? `${best.score} failing` : 'failing'})`
                     : `=== no parallel attempt passed; the loop starts from [a${best.i + 1}] (${best.score < 1e6 ? `${best.score} failing` : 'failing'})`);
-                lastFailure = `check ${why}:\n${tail(best.ran.output, CHECK_OUTPUT_CHARS)}`;
+                lastFailure = `check ${why}:\n${headTail(best.ran.output)}`;
             } else {
                 lastFailure = best?.error || 'no attempt produced a usable reply';
             }
@@ -1030,10 +1081,12 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         for (let attempt = 1; !raced && attempt <= maxAttempts; attempt++) {
             const temp = temperatureFor(attempt);
             const sampling = samplingFor(model, temp);
-            // A cut-off or runaway reply is reissued at most MAX_FREE_RETRIES times with a budget; after that the
-            // request runs to max_tokens, so the call always gets a real reply.
-            const reply = await chat(key, { model, messages, maxTokens, attempt: check ? attempt : 0, sampling,
-                thinkBudget: free < MAX_FREE_RETRIES ? thinkBudget : 0, noThinking: free > 0, signal: stop, say: log });
+            // A cut-off or runaway reply is reissued at most MAX_FREE_RETRIES times, each with twice the thinking budget
+            // (up to MAX_THINK_BUDGET, with room to write); after that the request runs to max_tokens, so the call
+            // always gets a real reply.
+            const tryBudget = free < MAX_FREE_RETRIES ? budgetAt(free) : 0;
+            const reply = await chat(key, { model, messages, maxTokens: free && tryBudget ? Math.max(maxTokens, Math.min(tryBudget + WRITE_ROOM, RACE_MAX_TOKENS)) : maxTokens,
+                attempt: check ? attempt : 0, sampling, thinkBudget: tryBudget, noThinking: free > 0, signal: stop, say: log }).catch((err) => { throw tooBig(err); });
             requests++;
             total.in += reply.usage.in;
             total.out += reply.usage.out;
@@ -1047,8 +1100,8 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             if (reply.finish === 'think_budget') {
                 free++;
                 runawaySeen = true;
-                log(`--- attempt ${attempt}: thinking passed the ${thinkBudget}-token budget with nothing written; cut off, ` +
-                    `free retry ${free} of ${MAX_FREE_RETRIES}`);
+                log(`--- attempt ${attempt}: thinking passed the ${tryBudget}-token budget with nothing written; cut off, ` +
+                    `free retry ${free} of ${MAX_FREE_RETRIES}${free < MAX_FREE_RETRIES ? `, budget raised to ${budgetAt(free)} tokens` : ', with no budget'}`);
                 messages.push({ role: 'user', content: budgetPrompt(reply.reasoningText, files.length > 0) });
                 attempt--;
                 continue;
@@ -1063,7 +1116,10 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                 continue;
             }
             if (reply.finish === 'length') {
-                lastFailure = `reply was cut off at max_tokens (${stats}); nothing written.`;
+                const thoughtOut = isRunaway(reply, files.length > 0, maxTokens);
+                if (thoughtOut) outOfThinking.push(`attempt ${attempt}`);
+                lastFailure = thoughtOut ? `reply spent all of max_tokens thinking after ${free} larger-budget retr${free === 1 ? 'y' : 'ies'} (${stats}); nothing written.`
+                    : `reply was cut off at max_tokens (${stats}); nothing written.`;
                 if (!check) throw new Error(`Reply was cut off at max_tokens (${stats}); nothing written. Split the task or raise max_tokens.`);
                 retry(reply.text, isRunaway(reply, true) ? runawayPrompt(reply.usage.out, true) : cutOffPrompt(reply.usage.out));
                 continue;
@@ -1091,7 +1147,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             }
             if (!check) return done(summary, changedFiles());
 
-            const ran = await runCheck(check, cwd, checkTimeout, stop);
+            const ran = noteCheck(await runCheck(check, cwd, checkTimeout, stop));
             stopped();
             log(`--- attempt ${attempt}: check ${ran.ok ? 'passed' : ran.timedOut ? 'timed out' : `failed (exit ${ran.code})`}\n${tail(ran.output, 20000)}`);
             if (ran.ok) {
@@ -1100,7 +1156,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                 break;
             }
             const why = ran.timedOut ? `timed out after ${checkTimeout}s` : `failed (exit ${ran.code})`;
-            const output = tail(ran.output, CHECK_OUTPUT_CHARS);
+            const output = headTail(ran.output);
             lastFailure = `check ${why}:\n${output}`;
             retry(reply.text, `Your edits were written and \`${check}\` ${why}. Output:\n\`\`\`\n${output}\n\`\`\``);
         }
@@ -1108,8 +1164,9 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         if (!passed && laneDone && !raced.laneWon) {
             // The loop lane already ran its steps alongside the attempts: no second loop.
             const lane = raced.lane;
-            if (lane.res?.lastOutput) lastFailure = `check ${tail(lane.res.lastOutput, CHECK_OUTPUT_CHARS)}`;
+            if (lane.res?.lastOutput) lastFailure = `check ${headTail(lane.res.lastOutput)}`;
             else if (lane.error) lastFailure = `${lastFailure ? `${lastFailure}\n` : ''}the loop lane stopped: ${lane.error.message}`;
+            if (lane.res && lane.res.steps >= maxSteps) outOfSteps = true;
             log('=== no lane passed: neither the one-shot attempts nor the loop lane');
         } else if (!passed && loop) {
             stopped();
@@ -1124,7 +1181,8 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                     `(${attemptsMade > 1 ? `${attemptsMade} parallel attempts` : 'attempt 1'} missed): ${check}${res.summary ? `\n${res.summary}` : ''}` };
             } else {
                 // The loop's own last check run, if it ran one; otherwise the one-shot failure still stands.
-                if (res.lastOutput) lastFailure = `check ${tail(res.lastOutput, CHECK_OUTPUT_CHARS)}`;
+                if (res.lastOutput) lastFailure = `check ${headTail(res.lastOutput)}`;
+                if (res.steps >= maxSteps) outOfSteps = true;
             }
         }
     } catch (err) {
@@ -1137,11 +1195,29 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     if (!passed) {
         restore();
         const tried = `${attemptsMade} attempt${attemptsMade === 1 ? '' : 's'}${steps ? ` and ${steps} tool-loop steps` : ''}`;
+        // Failures that are not the model's code: the check setup, the thinking budget, the step and time caps.
+        const same = sameFailure(checkRuns, [cwd]);
+        if (same) {
+            warn(`all ${same} check runs failed with the same output, whatever the edits: the check setup may be wrong ` +
+                '(for example, it is not testing the edited copy). Fix the check before handing the task on.');
+        }
+        if (outOfThinking.length) {
+            warn(`${outOfThinking.join(', ')} ran out of thinking budget before writing any file, with the budget doubled ` +
+                `on each retry up to ${MAX_THINK_BUDGET} tokens: that is the budget, not a wrong answer. Raise think_budget ` +
+                '(--think-budget), or split the task into smaller ones with explicit files.');
+        }
+        const notes = [
+            outOfSteps && `the tool loop used all ${maxSteps} steps; max_steps (--max-steps) raises the cap, up to ${MAX_STEPS}.`,
+            checkRuns.some((r) => r.timedOut) && `the check timed out after ${checkTimeout} s; check_timeout_s (--check-timeout) raises it, up to 3600.`,
+        ].filter(Boolean);
+        notes.forEach((n) => log(`--- note: ${n}`));
+        const extra = [...warnings.map((w) => `warning: ${w}`), ...notes.map((n) => `note: ${n}`)].map((l) => `${l}\n`).join('');
         log(`=== gave up after ${tried}; every file restored`);
         return {
             ok: false,
-            text: `check did not pass in ${tried}; every file is back as it was. Last ${lastFailure}\n(${statsFor()})\n` +
+            text: `check did not pass in ${tried}; every file is back as it was. Last ${lastFailure}\n${extra}(${statsFor()})\n` +
                 FALLBACK_HINT,
+            ...(warnings.length ? { warnings } : {}),
             fallback: 'opencode',
             attempts: attemptsMade,
             ...(steps ? { steps } : {}),
@@ -1215,6 +1291,6 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     // A self-check that did not finish is still a success: the files pass the check (its edits were undone if they
     // broke it). verified: false says the extra review is unfinished, but there is no fallback: the check passed.
     return { ok: true, attempts: passed.attempts, ...(steps ? { steps } : {}), usage: { ...total }, files: changed,
-        ...(verified !== undefined ? { verified } : {}),
-        text: `${body}${verifyNote ? `\n${verifyNote}` : ''}\n${lineTotals(changed)}\n(${statsFor()})` };
+        ...(verified !== undefined ? { verified } : {}), ...(warnings.length ? { warnings } : {}),
+        text: `${body}${verifyNote ? `\n${verifyNote}` : ''}${warnings.map((w) => `\nwarning: ${w}`).join('')}\n${lineTotals(changed)}\n(${statsFor()})` };
 }

@@ -37,12 +37,62 @@ export function parseBlocks(text) {
 }
 
 const lead = (line) => line.match(/^[ \t]*/)[0];
+// Typographic quotes, dashes and odd spaces as their plain ASCII forms.
+const plain = (text) => text.replace(/[\u2018\u2019\u201A\u201B]/g, "'").replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    .replace(/[\u2010-\u2015\u2212]/g, '-').replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, ' ');
 const LINE_MATCHERS = [
     // Same lines, ignoring leading and trailing whitespace on each.
     ['line-trimmed', (line) => line.trim()],
     // Same tokens: every run of whitespace counts as one space.
     ['whitespace-normalized', (line) => line.trim().replace(/\s+/g, ' ')],
+    // The same again after plain quotes, dashes and spaces: a search retyped with smart punctuation.
+    ['unicode-normalized', (line) => plain(line).trim().replace(/\s+/g, ' ')],
 ];
+// read_file shows lines as "12: text"; a search copied with those prefixes on every line has them removed.
+const NUMBERED = /^\d+: ?/;
+const numbered = (text) => {
+    const lines = text.split('\n').filter((l) => l.trim());
+    return lines.length > 0 && lines.every((l) => NUMBERED.test(l));
+};
+const unnumber = (text) => text.split('\n').map((l) => l.replace(NUMBERED, '')).join('\n');
+
+const HINT_LINES = 12;
+const HINT_LINE_CHARS = 200;
+// A short hint for a search that missed: the replacement is already there (an edit that already applied), or the
+// lines closest to the search, numbered as read_file shows them. Each search line votes for where the search starts
+// when it matches a file line ignoring whitespace; at least half must agree.
+export function missHint(content, search, replace = '') {
+    const key = (l) => plain(l).replace(/\s+/g, ' ').trim();
+    if (replace.trim().length >= 20 && key(content.replace(/\s+/g, ' ')).includes(key(replace.replace(/\s+/g, ' ')))) {
+        return 'The replace text is already in the file, so this edit may already be applied.';
+    }
+    const lines = content.split('\n');
+    const wantedLines = search.split('\n');
+    const distinct = (v) => /[\p{L}\p{N}]/u.test(v);
+    const positions = new Map();
+    lines.forEach((l, i) => {
+        const v = key(l);
+        if (distinct(v)) positions.set(v, [...(positions.get(v) || []), i]);
+    });
+    const votes = new Map();
+    let wanted = 0;
+    wantedLines.forEach((l, off) => {
+        const v = key(l);
+        if (!distinct(v)) return;
+        wanted++;
+        for (const i of positions.get(v) || []) votes.set(i - off, (votes.get(i - off) || 0) + 1);
+    });
+    const [start, count] = [...votes].reduce((best, v) => (v[1] > best[1] ? v : best), [0, 0]);
+    if (!count || count * 2 < wanted) return '';
+    const matched = wantedLines.flatMap((l, off) => {
+        const i = start + off;
+        return key(l) && i >= 0 && i < lines.length && key(lines[i]) === key(l) ? [i] : [];
+    });
+    const from = matched[0];
+    const to = Math.min(matched.at(-1) + 1, from + HINT_LINES);
+    return ['The closest lines in the file:', ...lines.slice(from, to)
+        .map((l, i) => `${from + i + 1}: ${l.length > HINT_LINE_CHARS ? `${l.slice(0, HINT_LINE_CHARS)}...` : l}`)].join('\n');
+}
 
 // Same block after removing each side's common indentation (a search copied at the wrong depth).
 function dedent(lines) {
@@ -67,8 +117,14 @@ function windows(contentLines, searchLines, same) {
     return hits;
 }
 
-export function findMatch(content, search) {
+export function findMatch(content, search, stripped = false) {
     if (search === '') return { error: 'search text is empty' };
+    // Line-number prefixes copied from read_file: match without them (only when the text as given does not match).
+    if (!stripped && numbered(search) && !content.includes(search)) {
+        const m = findMatch(content, unnumber(search), true);
+        if (!m.error) return { ...m, how: m.how === 'exact' ? 'line numbers removed' : `line numbers removed, ${m.how}`, unnumbered: true };
+        if (/matches \d+ places/.test(m.error)) return m;
+    }
     const exact = content.split(search).length - 1;
     if (exact === 1) {
         const start = content.indexOf(search);
@@ -113,8 +169,10 @@ function reindent(text, { was, is }) {
 
 export function replaceOnce(content, search, replace) {
     const m = findMatch(content, search);
-    if (m.error) return m;
-    const text = m.indent ? reindent(replace, m.indent) : replace;
+    if (m.error) return { ...m, hint: missHint(content, numbered(search) ? unnumber(search) : search, replace) };
+    // A search copied with line numbers usually has them in the replacement too.
+    const bare = m.unnumbered && numbered(replace) ? unnumber(replace) : replace;
+    const text = m.indent ? reindent(bare, m.indent) : bare;
     // An empty replacement deletes the lines, so drop the newline after them too.
     const end = m.end + (replace === '' && content[m.end] === '\n' ? 1 : 0);
     return { content: content.slice(0, m.start) + text + content.slice(end), how: m.how, start: m.start };
@@ -126,7 +184,7 @@ export function applyEdits(content, body) {
     let edits = 0;
     for (const [, search, replace] of body.matchAll(/<<<<<<< SEARCH\n([\s\S]*?)\n=======\n([\s\S]*?)\n?>>>>>>> REPLACE/g)) {
         const res = replaceOnce(content, search, replace);
-        if (res.error) errors.push(`edit ${edits + 1}: ${res.error}`);
+        if (res.error) errors.push(`edit ${edits + 1}: ${res.error}${res.hint ? `\n${res.hint}` : ''}`);
         else {
             content = res.content;
             if (res.how !== 'exact') fuzzy.push(res.how);

@@ -2,9 +2,9 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname, delimiter } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { FIX_SYSTEM, SELF_CHECK_PROMPT } from '../loop.mjs';
 import { failCount } from '../ask.mjs';
@@ -151,7 +151,7 @@ test('verify: when the lane wins, the self-check runs in its conversation and th
     assert.match(l, /=== verify: passed: the model's self-check found nothing to fix: the rules hold \(in the loop lane's conversation, 2 steps\)/);
     const sc = requests().find((r) => r.messages.some((m) => typeof m.content === 'string' && m.content.includes(SELF_CHECK_PROMPT)));
     assert.ok(sc, 'a request carries the self-check prompt');
-    assert.equal(sc.messages[0].content, FIX_SYSTEM, 'the lane keeps its own system prompt');
+    assert.ok(sc.messages[0].content.startsWith(FIX_SYSTEM), 'the lane keeps its own system prompt');
     assert.ok(sc.messages.some((m) => m.role === 'assistant' && m.tool_calls?.some((c) => c.function.name === 'edit')),
         'the fix turns lead the self-check');
     assert.deepEqual(readdirSync(tmp), [], 'every copy was removed');
@@ -218,9 +218,13 @@ test('race: a portfolio of thinking budgets races the loop lane; when nothing pa
     // Each attempt is told apart by its output cap: 16384 (4k budget), 28672 (12k budget), 32768 (20k budget); the
     // loop lane is the only request that carries tools.
     const long = { reasoning_text: 'Let me think about this carefully. '.repeat(600), content: 'never seen' }; // ~5k tokens
+    // a1's reissues double its budget: 8k (same cap), then 16k (cap 24576); each thinks past it.
+    const longer = { reasoning_text: long.reasoning_text.repeat(2), content: 'never seen' }; // ~10k tokens
+    const longest = { reasoning_text: long.reasoning_text.repeat(4), content: 'never seen' }; // ~21k tokens
     writeFileSync(join(dir, 'routes.json'), JSON.stringify({
         '"tools"': [tools(['read_file', { path: 'one.txt' }])],
-        '"max_tokens":16384': [long, long],
+        '"max_tokens":16384': [long, longer],
+        '"max_tokens":24576': [longest],
         '"max_tokens":28672': [{ reasoning_text: long.reasoning_text, content: block(one, edit('start', 'alpha beta')) }],
         '"max_tokens":32768': [{ content: block(one, edit('start', 'alpha')), reasoning: 10000, out: 10500 }],
     }));
@@ -231,12 +235,17 @@ test('race: a portfolio of thinking budgets races the loop lane; when nothing pa
     assert.deepEqual(structured, { ok: false, fallback: 'opencode', attempts: 3, steps: 2 });
     const l = readFileSync(log, 'utf8');
     assert.match(l, /=== 3 parallel first attempts \(temperatures 0\.6, 0\.3, 0\.8; thinking budgets 4096, 12288, 20480; output caps 16384, 28672, 32768\)/);
-    assert.match(l, /\[a1\] thinking passed the 4096-token budget with nothing written; reissued to write its edits now \(free retry 1 of 1\)/);
-    assert.match(l, /\[a1\] thinking passed the 4096-token budget with nothing written again; dropped/);
+    assert.match(l, /\[a1\] thinking passed the 4096-token budget with nothing written; reissued to write its edits now, budget raised to 8192 tokens \(free retry 1 of 2\)/);
+    assert.match(l, /\[a1\] thinking passed the 8192-token budget with nothing written; reissued to write its edits now, budget raised to 16384 tokens \(free retry 2 of 2\)/);
+    assert.match(l, /\[a1\] thinking passed the 16384-token budget with nothing written again; dropped: out of thinking budget/);
+    assert.match(text, /warning: attempt 1 ran out of thinking budget before writing any file, with the budget doubled on each retry up to 16384 tokens: that is the budget, not a wrong answer/);
     assert.doesNotMatch(l, /\[a2\] thinking passed/, 'the 12k attempt was not cut off at ~5k tokens');
     assert.match(l, /no parallel attempt passed and the loop lane is out of steps; \[a2\] was closest \(1 failing\)/);
     assert.match(l, /=== no lane passed: neither the one-shot attempts nor the loop lane/);
-    assert.equal(requests().length, 6, 'two tries for a1, one each for a2 and a3, two steps for the lane');
+    assert.equal(requests().length, 7, 'three tries for a1, one each for a2 and a3, two steps for the lane');
+    const a1 = requests().filter((r) => !r.tools && r.max_tokens !== 28672 && r.max_tokens !== 32768);
+    assert.deepEqual(a1.map((r) => r.max_tokens), [16384, 16384, 24576], 'a 16k budget gets room to write');
+    assert.equal(a1[2].messages.filter((m) => m.role === 'user').length, 2, 'one budget prompt, not one per reissue');
     assert.equal(readFileSync(one, 'utf8'), 'start\n');
     assert.deepEqual(readdirSync(tmp), []);
 });
@@ -259,4 +268,65 @@ test('race: a runaway attempt is dropped, with no runaway retries inside the rac
     // The lane's requests carry a 16384 cap too; tell them apart by their tools.
     assert.equal(requests().filter((r) => !r.tools && r.max_tokens !== 32768).length, 2, 'no retries for a1 or a2');
     assert.equal(readFileSync(one, 'utf8'), `${ALL}\n`);
+});
+
+test('race: a check in a copy gets the copy\'s src/ and root first on PYTHONPATH; the real tree\'s check does not', () => {
+    const { one, log } = setup();
+    mkdirSync(join(dir, 'src'));
+    writeFileSync(join(dir, 'src', 'mod.py'), '');
+    writeFileSync(join(dir, 'env.mjs'), "console.log('PYTHONPATH=' + process.env.PYTHONPATH);\n");
+    const check = `"${process.execPath}" env.mjs && "${process.execPath}" check.mjs`;
+    writeFileSync(join(dir, 'routes.json'), JSON.stringify({
+        '"tools"': [tools(['read_file', { path: 'one.txt' }])],
+        '"max_tokens":16384': [block(one, edit('start', ALL))],
+    }));
+    const { text, isError } = call({ prompt: 'x', files: [one], check, log_file: log }, [],
+        { MOCK_ROUTES: join(dir, 'routes.json'), PYTHONPATH: 'from-env' });
+    assert.equal(isError, false, text);
+    const seen = readFileSync(log, 'utf8').match(/PYTHONPATH=(.*)/)[1].split(delimiter);
+    assert.equal(seen.length, 3, seen.join(' | '));
+    assert.match(seen[0], /wgpt-attempt-\w+[/\\]src$/);
+    assert.equal(seen[1], dirname(seen[0]));
+    assert.equal(seen[2], 'from-env');
+});
+
+test('race: every check failing the same way, and a package linked back into the real tree, are warned about', () => {
+    const { log } = setup();
+    // The code under test lives in lib/, which node_modules links back to: every copy's check runs the real lib.
+    mkdirSync(join(dir, 'lib'));
+    mkdirSync(join(dir, 'node_modules', '@me'), { recursive: true });
+    const lib = join(dir, 'lib', 'index.js');
+    writeFileSync(lib, 'export const f = () => 1;\n');
+    symlinkSync(join(dir, 'lib'), join(dir, 'node_modules', '@me', 'lib'), 'junction');
+    // The same failure every time, only its path and timing differ.
+    writeFileSync(join(dir, 'same.mjs'), "console.log(`AssertionError in ${process.cwd()}: f() returned 1 (took ${Math.round(Math.random() * 90) + 10} ms)`);\n" +
+        'process.exit(1);\n');
+    const check = `"${process.execPath}" same.mjs`;
+    writeFileSync(join(dir, 'routes.json'), JSON.stringify({
+        '"tools"': [tools(['edit', { path: 'lib/index.js', search: '1', replace: '2' }], ['run_check']),
+            tools(['edit', { path: 'lib/index.js', search: '2', replace: '3' }], ['run_check'])],
+        '"max_tokens":16384': [block(lib, edit('export const f = () => 1;', 'export const f = () => 4;'))],
+    }));
+    const { text, isError } = call({ prompt: 'x', files: [lib], check, cwd: dir, max_steps: 2, log_file: log }, [], { MOCK_ROUTES: join(dir, 'routes.json') });
+    assert.equal(isError, true);
+    assert.match(text, /warning: all 3 check runs failed with the same output, whatever the edits: the check setup may be wrong \(for example, it is not testing the edited copy\)/);
+    assert.match(text, /warning: node_modules\/@me\/lib links to .* in the real tree, so a check in a copy that imports "@me\/lib" runs the original lib[/\\]index\.js, not the edits/);
+    assert.match(text, /note: the tool loop used all 2 steps; max_steps \(--max-steps\) raises the cap, up to 40\./);
+    assert.match(text, /fallback: opencode/);
+    const l = readFileSync(log, 'utf8');
+    // The probe runs before the first check.
+    assert.ok(l.indexOf('!!! WARNING: node_modules/@me/lib') < l.indexOf('AssertionError in'), 'warned before the first check ran');
+    assert.match(l, /!!! WARNING: all 3 check runs failed with the same output/);
+    assert.equal(readFileSync(lib, 'utf8'), 'export const f = () => 1;\n');
+});
+
+test('race: different failures are not blamed on the check', () => {
+    const { one, check } = setup();
+    writeFileSync(join(dir, 'routes.json'), JSON.stringify({
+        '"tools"': [tools(['edit', { path: 'one.txt', search: 'start', replace: 'alpha' }], ['run_check'])],
+        '"max_tokens":16384': [block(one, edit('start', 'beta'))],
+    }));
+    const { text, isError } = call({ prompt: 'x', files: [one], check, max_steps: 1 }, [], { MOCK_ROUTES: join(dir, 'routes.json') });
+    assert.equal(isError, true);
+    assert.doesNotMatch(text, /same output/);
 });

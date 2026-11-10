@@ -2,11 +2,15 @@
 // (read_file, edit, run_check, run_node, done) until the check passes or the step cap is reached. It is also
 // used for the optional verify step, where the model tests the spec rules the check does not cover.
 
-import { readFileSync, existsSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
-import { resolve, relative, isAbsolute } from 'node:path';
+import { readFileSync, existsSync, writeFileSync, rmSync, realpathSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve, relative, isAbsolute, join } from 'node:path';
 import { matchAllowed, readText, writeText, replaceOnce } from './edits.mjs';
 
 const OUTPUT_CHARS = 4000;
+// Long output keeps its start (often the first traceback) and its end (the summary); the rest is saved to a file.
+const HEAD_CHARS = 1500;
+const TAIL_CHARS = 2500;
 const READ_LINES = 400;
 const READ_CHARS = 20000;
 // Old tool results are cut down before each request: resending them in full on every step is what makes agent loops expensive.
@@ -37,7 +41,8 @@ export const TOOLS = [
         name: 'edit',
         description: 'Replace one piece of text in a file you may change. search must match one place in the current ' +
             'file (copy it from the file, without line numbers; small differences in indentation and spacing are ' +
-            'tolerated). Keep each edit small: one change per call. To create a new allowed file, pass an empty search.',
+            'tolerated). Do not include the line-number prefixes ("12: ") that read_file shows. Keep each edit small: one ' +
+            'change per call. To create a new allowed file, pass an empty search.',
         parameters: { type: 'object', properties: {
             path: { type: 'string', description: 'One of the files you may change.' },
             search: { type: 'string', description: 'The exact current text to replace (a few whole lines).' },
@@ -54,7 +59,10 @@ export const TOOLS = [
         description: 'Run a JavaScript snippet with Node as an ES module in the working directory, and get its output. ' +
             'Use it to see what the code really does: import a project file with a relative path such as ' +
             '"./src/x.js", call it, and console.log the result; or assert expected behaviour with node:assert. ' +
-            'Snippets must not write files. They run sandboxed: no child processes, and no file access outside the working directory.',
+            'Snippets must not write files. They run sandboxed with Node\'s permission model: they may read the working ' +
+            'directory, the attached files and node_modules folders above the working directory; they may not read ' +
+            'anything else, write outside the working directory, or start processes, workers or addons. Use read_file ' +
+            'for files outside the working directory.',
         parameters: { type: 'object', properties: {
             code: { type: 'string', description: 'The ES module source to run.' },
         }, required: ['code'] },
@@ -82,6 +90,22 @@ const RULES = `How to work:
 
 export const FIX_SYSTEM = `You fix code until a check command passes, working through tools.\n\n${RULES}`;
 
+// Told up front, so the model does not spend steps on edits the edit tool refuses (helper files, the tests).
+export function allowedFilesText(files, cwd) {
+    const shown = files.map((f) => {
+        const rel = relative(cwd, f);
+        return rel && !rel.startsWith('..') && !isAbsolute(rel) ? rel : f;
+    });
+    return `Files you may change (edit refuses every other file; you can still read them): ${shown.join(', ') || '(none)'}. ` +
+        'If the fix seems to need another file, such as a new helper module, put that code in one of these files instead.';
+}
+
+// A snippet that hit the sandbox gets told the rules, so it does not try the same read again.
+const DENIED = /ERR_ACCESS_DENIED|Access to this API has been restricted/;
+const DENIED_HINT = '\n[run_node is sandboxed: it may read only the working directory, the attached files and node_modules ' +
+    'folders above the working directory, may write only in the working directory, and may not start processes. ' +
+    'Use read_file for other files.]';
+
 // verify: once the check passes, the model tests the spec rules the tests miss.
 const VERIFY_STEPS_TEXT = `- Reread the task and the spec. Pick the rules the tests skip: edge cases, invalid inputs, exact error messages and
   values, every case the spec lists.
@@ -101,6 +125,20 @@ ${VERIFY_STEPS_TEXT}`;
 export const SELF_CHECK_PROMPT = `The check passes. Tests often miss rules the task and its spec state, so test those
 rules yourself now before you finish:
 ${VERIFY_STEPS_TEXT}`;
+
+// The first head and last tail characters, cut at line ends where one is near.
+export function headTail(text, head = HEAD_CHARS, tailN = TAIL_CHARS) {
+    if (text.length <= head + tailN) return text;
+    let a = text.lastIndexOf('\n', head);
+    if (a < head / 2) a = head;
+    let b = text.indexOf('\n', text.length - tailN);
+    if (b < 0 || b > text.length - tailN / 2) b = text.length - tailN;
+    else b++;
+    return `${text.slice(0, a)}\n[...${b - a} chars cut...]\n${text.slice(b)}`;
+}
+
+// The gateway's answer to a request over the model's context window.
+export const isContextOverflow = (err) => /context_length_exceeded|maximum context length/i.test(err?.message || '');
 
 function tail(text, n) {
     return text.length > n ? `[...${text.length - n} chars cut]\n${text.slice(-n)}` : text;
@@ -155,11 +193,44 @@ function assistantTurn(reply, extra = {}) {
 
 // ctx.selfCheck: { steps }: when the fix loop's done is accepted, the same conversation goes on with
 // SELF_CHECK_PROMPT for up to that many more steps, instead of a fresh verify loop that re-derives the spec.
+// Full outputs too long to show go to a temp folder that read_file may open; it is removed when the loop ends.
 export async function runLoop(ctx) {
+    const saved = { dir: null, paths: new Map() };
+    try {
+        return await loop(ctx, saved);
+    } finally {
+        if (saved.dir) rmSync(saved.dir, { recursive: true, force: true });
+    }
+}
+
+// Every old tool result but the latest cut down, and every turn's reasoning dropped: for a request over the
+// context window.
+function hardTrim(messages) {
+    const last = messages.findLastIndex((m) => m.role === 'tool');
+    messages.forEach((m, i) => {
+        if (m.role === 'assistant') delete m.reasoning_content;
+        if (m.role === 'tool' && i !== last && m.content.length > OLD_RESULT_CHARS) m.content = `${m.content.slice(0, OLD_RESULT_CHARS)}${TRIMMED}`;
+    });
+}
+
+async function loop(ctx, saved) {
+    const clip = (text) => {
+        if (text.length <= OUTPUT_CHARS) return text;
+        let path = saved.paths.get(text);
+        if (!path) {
+            saved.dir ||= mkdtempSync(join(tmpdir(), 'wgpt-output-'));
+            path = join(saved.dir, `output-${saved.paths.size + 1}.txt`);
+            writeFileSync(path, text);
+            saved.paths.set(text, path);
+        }
+        return `${headTail(text)}\n[full output: ${path}, ${text.split('\n').length} lines; read_file it with offset]`;
+    };
+    const savedFile = (abs) => [...saved.paths.values()].includes(abs);
     // ctx.history: an earlier conversation to continue (a winning one-shot attempt's, ending with its reply); ctx.user
     // then follows it and carries the instructions, since ctx.system is not sent.
-    const messages = ctx.history ? [...ctx.history, { role: 'user', content: ctx.user }]
-        : [{ role: 'system', content: ctx.system }, { role: 'user', content: ctx.user }];
+    const allowed = allowedFilesText(ctx.files, ctx.cwd);
+    const messages = ctx.history ? [...ctx.history, { role: 'user', content: `${ctx.user}\n\n${allowed}` }]
+        : [{ role: 'system', content: `${ctx.system}\n\n${allowed}` }, { role: 'user', content: ctx.user }];
     let mode = ctx.mode;
     let limit = ctx.maxSteps;
     let fixEnd = null; // set once the fix part finished and the self-check began
@@ -184,7 +255,7 @@ export async function runLoop(ctx) {
         const ran = await ctx.runCheck();
         const why = ran.ok ? 'PASSED' : ran.timedOut ? 'TIMED OUT' : `FAILED (exit ${ran.code})`;
         lastCheck = { ok: ran.ok, at: edits, output: `${why}\n${ran.output}` };
-        return `${why}\n${tail(ran.output, OUTPUT_CHARS)}`;
+        return clip(`${why}\n${ran.output}`);
     };
     const passingNow = async () => (lastCheck.at === edits ? lastCheck.ok : (await check(), lastCheck.ok));
 
@@ -192,10 +263,11 @@ export async function runLoop(ctx) {
         read_file({ path, offset, limit }) {
             if (typeof path !== 'string' || !path) return 'error: path is required';
             const abs = resolve(ctx.cwd, path);
-            if (!inCwd(abs) && !ctx.readable.includes(abs)) return `error: ${path} is outside the working directory`;
+            const extra = ctx.readable.includes(abs) || savedFile(abs);
+            if (!inCwd(abs) && !extra) return `error: ${path} is outside the working directory`;
             if (!existsSync(abs)) return `error: ${path} does not exist`;
             // The check above is on the path as written; a link inside the tree must not lead out of it.
-            if (!ctx.readable.includes(abs) && !inCwd(realpathSync(abs), realpathSync(ctx.cwd))) {
+            if (!extra && !inCwd(realpathSync(abs), realpathSync(ctx.cwd))) {
                 return `error: ${path} is outside the working directory`;
             }
             let text;
@@ -213,7 +285,10 @@ export async function runLoop(ctx) {
                 return 'error: path, search and replace must all be strings';
             }
             const target = matchAllowed(resolve(ctx.cwd, path), ctx.files) || matchAllowed(path, ctx.files);
-            if (!target) return `error: ${path} is not a file you may change. Allowed: ${ctx.files.join(', ')}`;
+            if (!target) {
+                return `error: ${path} is not a file you may change; it is read-only. Allowed: ${ctx.files.join(', ')}. ` +
+                    'Put the change in one of those files instead.';
+            }
             const cur = readText(target);
             if (!cur) {
                 if (search !== '') return `error: ${path} does not exist yet; create it with an empty search`;
@@ -229,7 +304,10 @@ export async function runLoop(ctx) {
                 return `filled ${path}`;
             }
             const res = replaceOnce(cur.text, search, replace);
-            if (res.error) return `error: ${res.error}. Nothing changed. Read the file again and copy the search text exactly.`;
+            if (res.error) {
+                return `error: ${res.error}. Nothing changed. Read the file again and copy the search text exactly.` +
+                    `${res.hint ? `\n${res.hint}` : ''}`;
+            }
             writeText(target, res.content, cur.crlf);
             edits++;
             const at = res.content.slice(0, res.start).split('\n').length;
@@ -252,14 +330,14 @@ export async function runLoop(ctx) {
                 ctx.log('--- run_node changed a task file; counted as an edit');
             }
             const head = ran.timedOut ? 'TIMED OUT' : `exit ${ran.code}`;
-            return `${head}\n${tail(ran.output, OUTPUT_CHARS) || '(no output)'}`;
+            return `${head}\n${clip(ran.output) || '(no output)'}${DENIED.test(ran.output) ? DENIED_HINT : ''}`;
         },
         async done({ summary }) {
             if (mode === 'verify' && !probes && doneRefusals++ === 0) {
                 return 'not yet: first test the spec rules with run_node.';
             }
             if (await passingNow()) return { finished: true, summary: String(summary || ''), at: edits };
-            return `not done: the check does not pass with your latest edits.\n${tail(lastCheck.output, OUTPUT_CHARS)}`;
+            return `not done: the check does not pass with your latest edits.\n${clip(lastCheck.output)}`;
         },
     };
 
@@ -301,9 +379,21 @@ export async function runLoop(ctx) {
         // cancels a request still running when time is up.
         const deadline = mode === 'verify' ? verifyUntil : 0;
         let reply;
+        const ask = () => ctx.chat(messages, { tools: toolSchemas(), maxTokens: ctx.maxTokens, ...(deadline ? { deadline } : {}),
+            ...(mode === 'verify' && ctx.verifyThink ? { budgetScale: 1, thinkBudget: ctx.verifyThink } : { budgetScale: 2 ** cuts }) });
         try {
-            reply = await ctx.chat(messages, { tools: toolSchemas(), maxTokens: ctx.maxTokens, ...(deadline ? { deadline } : {}),
-                ...(mode === 'verify' && ctx.verifyThink ? { budgetScale: 1, thinkBudget: ctx.verifyThink } : { budgetScale: 2 ** cuts }) });
+            try {
+                reply = await ask();
+            } catch (err) {
+                if (!isContextOverflow(err)) throw err;
+                // Over the context window: cut the history hard and try once more.
+                hardTrim(messages);
+                ctx.log(`--- ${mode} step ${step}: over the context window; history cut to the latest tool result, retried once`);
+                reply = await ask().catch((again) => {
+                    throw isContextOverflow(again) ? new Error('the conversation is over the model\'s context window even after ' +
+                        'trimming its history; split the task, or attach fewer or smaller context_files') : again;
+                });
+            }
         } catch (err) {
             if (deadline && Date.now() >= deadline) return timeUp();
             throw err;
