@@ -150,13 +150,15 @@ An MCP tool call blocks until it returns, and a checked task can run for several
 | Tool | What it does |
 |---|---|
 | `start_warriorgpt_job` | Takes the same arguments as `ask_warriorgpt`, starts the run in the server process and returns a `job_id` at once. Bad arguments (for example `check` without `files`) fail here, not later. |
-| `get_warriorgpt_job_status` | `job_id` gives the state (`queued`, `running`, `cancelling`, `done`, `failed`, `cancelled`), the time elapsed, progress (one-shot replies, the latest tool-loop step, request retries), the last `log_lines` log lines (default 15, max 100) and `next_poll_s`. With no `job_id` it lists every job. |
+| `get_warriorgpt_job_status` | `job_id` gives the state (`queued`, `running`, `cancelling`, `done`, `failed`, `cancelled`), the time elapsed, progress (one-shot replies, the latest tool-loop step, request retries, and `next_retry: {attempt, of, reason, at}` while a retry is waiting), the job it waits for (`waiting_for`) when it is queued behind one, the last `log_lines` log lines (default 15, max 100) and `next_poll_s`. With no `job_id` it lists every job. |
 | `get_warriorgpt_job_result` | The result of a finished job, in the same shape `ask_warriorgpt` returns: the text, `isError`, and `structuredContent` with `ok`, `fallback` and `attempts` when the check never passed. A job that has not finished answers with its state instead. |
 | `cancel_warriorgpt_job` | Stops the job's requests and checks and puts every file it may change back as it was. A queued job is dropped at once; a running one usually stops within a second or two, and the call waits up to 5 s for that. |
 
 The status and result tools take `wait_s` (at most 30): the call waits that long for the job to finish, and answers as soon as it does. The tool descriptions ask the model to poll about every 30 s (15 s in the first minute, 60 s after five minutes) and to do other work in between.
 
-Jobs live in the server process. At most three run at once (`WARRIORGPT_MAX_JOBS`) and the rest queue, up to 20. Finished jobs are kept for an hour. When the client disconnects, running jobs are cancelled and their files restored, since nobody is left to read the results. A plain `ask_warriorgpt` call still in flight finishes as before.
+Jobs live in the server process. At most three run at once (`WARRIORGPT_MAX_JOBS`) and the rest queue, up to 20. A job whose `files` or `output_file` overlap those of a running job, or of a job queued before it, waits until that job finishes: a job that misses restores its files from its own snapshot, which would wipe the other job's edits. Finished jobs are kept for an hour. When the client disconnects, running jobs are cancelled and their files restored, since nobody is left to read the results; a plain `ask_warriorgpt` call still in flight finishes as before. On SIGTERM or SIGINT the server cancels every run, jobs and plain calls alike, waits for their files to be restored (at most 10 s), and then exits.
+
+A `tools/call` that carries `_meta.progressToken` gets `notifications/progress` messages while `ask_warriorgpt` runs, one for each reply, tool-loop step or retry, with a short message like `1 one-shot reply, fix step 4 of 30`. Clients that reset their tool timeout on progress can then wait out a checked call. Unknown tool names, both MCP tools and the tool loop's tools, are answered with the list of real ones.
 
 The `warriorgpt-ask` CLI with the Bash tool's `run_in_background` still works. Claude keeps working, gets notified when it exits, reads the summary and the JSON line, and reviews `git diff`:
 
@@ -172,11 +174,13 @@ The gateway lets each API key have 6 requests in flight and answers the rest wit
 
 A request is sent again, up to 5 more times, when:
 
-- the gateway answers 429 for a busy key. The wait is the server's `Retry-After` (seconds, fractions too, or an HTTP date) or the backoff, whichever is longer. A quota 429 (`quota_exceeded`) or a `Retry-After` over 60 s fails at once.
-- the connection fails before any reply arrives (`fetch failed`, `ECONNRESET`, `ECONNREFUSED`, a timeout, `socket hang up`). Certificate errors are not retried.
-- the stream is cut short: the gateway's `upstream_stream_incomplete` error event, `finish_reason: "incomplete"`, or a stream that closes without a finish reason. Nothing from a cut reply is used.
+- the gateway answers 429 for a busy key, or 502 or 503 (`upstream_unreachable`, `upstream_error`). A quota 429 (`quota_exceeded`) or a wait over 60 s fails at once.
+- the gateway answers 504 (`upstream_timeout`): at most 2 retries. A 500 (`internal_error`): at most 1.
+- no response headers arrive within 90 s (`WARRIORGPT_HEADER_TIMEOUT_MS`; it must stay above the gateway's own 30 s wait for a free slot), or the stream sends nothing for 120 s (`WARRIORGPT_IDLE_TIMEOUT_MS`, reset on every chunk). These share the 504 cap of 2 retries. There is no limit on the total time a stream may run.
+- the connection fails (`fetch failed`, `ECONNRESET`, `ECONNREFUSED`, `socket hang up`, `terminated`), before the reply or in the middle of it. Requests are stateless, so the retry starts over. Certificate errors are not retried.
+- the stream is cut short: the gateway's `upstream_stream_incomplete` error event, a stream that closes without a finish reason, or one whose finish reason is anything but `stop`, `length` or `tool_calls` (for example `incomplete`). Nothing from a cut reply is used.
 
-The backoff starts at 1 s and doubles, up to 30 s, with jitter. Each retry is logged to `log_file`, to stderr, and to a job's log, for example `--- WarriorGPT: 429 concurrency_limit_exceeded: Too many concurrent requests for this API key (limit 6). ...; retry 1 of 5 in 5.0 s`. When the retries run out, the error carries the server's message and says how many tries it took. A slot is released while a request waits to retry.
+A server's `x-should-retry: true` or `false` header overrides all of this. The wait is the server's `retry-after-ms` or `Retry-After` (seconds, fractions too, or an HTTP date) or the backoff, whichever is longer. The backoff starts at 1 s and doubles, up to 30 s, with jitter. Each retry is logged to `log_file`, to stderr, and to a job's log, for example `--- WarriorGPT: 429 concurrency_limit_exceeded: Too many concurrent requests for this API key (limit 6). ...; retry 1 of 5 in 5.0 s`. When the retries run out, the error carries the server's message and says how many tries it took. A slot is released while a request waits to retry.
 
 Models:
 
@@ -195,6 +199,8 @@ Models:
 | `WARRIORGPT_MAX_JOBS` | Jobs the MCP server runs at once; the rest queue. Default 3. |
 | `WARRIORGPT_MAX_RETRIES` | Times a request is sent again after a 429, a dropped connection or a cut stream. Default 5; 0 turns retries off. |
 | `WARRIORGPT_RETRY_BASE_MS` | First retry backoff in ms, doubled on each retry up to 30 s. Default 1000. |
+| `WARRIORGPT_HEADER_TIMEOUT_MS` | How long to wait for response headers before the try counts as timed out and is retried. Default 90000. |
+| `WARRIORGPT_IDLE_TIMEOUT_MS` | How long a stream may go without a chunk before it counts as stalled and is retried. Default 120000. |
 
 Pass variables at registration with `claude mcp add ... -e WARRIORGPT_MODEL=local.gpt-oss-120b -- ...`. Avoid passing the API key this way: Claude Code stores it in plain text in its config file.
 
