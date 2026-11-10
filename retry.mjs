@@ -9,9 +9,15 @@ const MAX_BACKOFF_MS = 30_000;
 // A longer Retry-After than this is a quota, not a busy key: fail at once with the server's message.
 export const MAX_RETRY_AFTER_MS = 60_000;
 const NO_RETRY_CODES = new Set(['quota_exceeded', 'insufficient_quota']);
-// Retries allowed per kind of failure, within maxRetries(): a timed-out try already waited a long time, and a 500
-// is the gateway's own failure, which a second try rarely fixes.
-export const KIND_CAPS = { timeout: 2, server: 1 };
+// Retries allowed per kind of failure, within maxRetries(): a timed-out try already waited a long time, a 500
+// is the gateway's own failure, which a second try rarely fixes, and a reset connection (502 upstream_unreachable)
+// that a network filter triggers on the request's content fails the same way every time.
+export const KIND_CAPS = { timeout: 2, server: 1, reset: 2 };
+// Added to the final error when a kind's retries run out.
+export const GIVE_UP_HINTS = {
+    reset: 'the same request was reset every time; if the prompt or files contain text a network filter may block ' +
+        '(e.g. shell_exec( ), that is the likely cause',
+};
 // The response waits on the gateway's own slot queue (up to 30 s) before headers, so this must be well above it.
 export const DEFAULT_HEADER_TIMEOUT_MS = 180_000;
 // No byte of the stream for this long: the connection is taken as dead (reasoning streams tokens steadily).
@@ -86,7 +92,8 @@ export function statusRetry(status, code, get) {
         return wait === null ? (should === 'true' ? { kind: 'busy', waitMs: 0 } : null) : { kind: 'busy', waitMs: wait };
     }
     if (waitMs !== null && waitMs > MAX_RETRY_AFTER_MS && should !== 'true') return null;
-    const kind = status === 502 || status === 503 ? 'busy' : status === 504 ? 'timeout' : status === 500 ? 'server'
+    const kind = status === 502 && code === 'upstream_unreachable' ? 'reset'
+        : status === 502 || status === 503 ? 'busy' : status === 504 ? 'timeout' : status === 500 ? 'server'
         : should === 'true' ? 'busy' : null;
     return kind ? { kind, waitMs: waitMs ?? 0 } : null;
 }

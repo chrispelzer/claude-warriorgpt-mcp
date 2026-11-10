@@ -128,7 +128,8 @@ test('a stream that keeps getting cut off ends in an error, and nothing is writt
 const headers = (h) => (name) => h[name] ?? null;
 
 test('gateway 5xx: 502/503 retried like a busy key, 504 as a timeout, 500 as a server error; x-should-retry overrides', () => {
-    assert.deepEqual(statusRetry(502, 'upstream_unreachable', headers({})), { kind: 'busy', waitMs: 0 });
+    assert.deepEqual(statusRetry(502, 'upstream_unreachable', headers({})), { kind: 'reset', waitMs: 0 });
+    assert.deepEqual(statusRetry(502, 'bad_gateway', headers({})), { kind: 'busy', waitMs: 0 });
     assert.deepEqual(statusRetry(503, '', headers({ 'retry-after': '2' })), { kind: 'busy', waitMs: 2000 });
     assert.deepEqual(statusRetry(504, 'upstream_timeout', headers({})), { kind: 'timeout', waitMs: 0 });
     assert.deepEqual(statusRetry(500, 'internal_error', headers({})), { kind: 'server', waitMs: 0 });
@@ -218,4 +219,21 @@ test('timeouts share the 504 cap of two retries', () => {
     assert.equal(isError, true);
     assert.match(text, /no data for 0\.1 s.*gave up after 3 tries/);
     assert.equal(times().length, 3);
+});
+
+test('a reset connection (502 upstream_unreachable) is retried twice, then fails with the server message and the filter hint', () => {
+    const reset = { status: 502, code: 'upstream_unreachable',
+        message: 'The connection to the model server failed or was reset before it answered. Retry the request. Correlation ID: abc123' };
+    const r = call({ prompt: 'hi' }, { env: { MOCK_FAIL_FIRST: JSON.stringify(Array(6).fill(reset)) } });
+    assert.equal(r.isError, true);
+    assert.equal(times().length, 3, 'two retries, not five');
+    assert.match(r.text, /^WarriorGPT 502 \(upstream_unreachable\): The connection to the model server failed or was reset before it answered\. Retry the request\. Correlation ID: abc123/);
+    assert.match(r.text, /gave up after 3 tries in \d+ s\); the same request was reset every time; if the prompt or files contain text a network filter may block \(e\.g\. shell_exec\( \), that is the likely cause$/);
+    // Other 502s and 503s keep the normal cap.
+    dir = mkdtempSync(join(tmpdir(), 'warriorgpt-retry-test-'));
+    const busy = call({ prompt: 'hi' }, { env: { MOCK_FAIL_FIRST: JSON.stringify([...Array(2).fill({ status: 502, code: 'bad_gateway' }),
+        ...Array(2).fill('503')]) } });
+    assert.equal(busy.isError, false, busy.text);
+    assert.equal(times().length, 5, 'four retries for 502 bad_gateway and 503');
+    assert.doesNotMatch(busy.text, /network filter/);
 });

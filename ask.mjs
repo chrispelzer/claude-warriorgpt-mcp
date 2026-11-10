@@ -9,7 +9,7 @@ import { availableParallelism, homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage } from './common.mjs';
 import { requestSlot } from './limit.mjs';
-import { KIND_CAPS, backoffMs, errorBody, headerTimeoutMs, idleTimeoutMs, isTransientNetworkError, maxRetries, serverWaitMs,
+import { KIND_CAPS, GIVE_UP_HINTS, backoffMs, errorBody, headerTimeoutMs, idleTimeoutMs, isTransientNetworkError, maxRetries, serverWaitMs,
     sleep, statusRetry } from './retry.mjs';
 
 const API_URL = `${API_BASE}/chat/completions`;
@@ -265,7 +265,10 @@ async function chat(key, { model, messages, maxTokens, attempt, sampling = {}, t
             } catch (err) {
                 const kind = err.kind || 'busy';
                 if (!err.retry || n >= tries || (KIND_CAPS[kind] !== undefined && (kinds[kind] || 0) >= KIND_CAPS[kind])) {
-                    if (err.retry && n > 1) err.message += ` (gave up after ${n} tries in ${Math.round((Date.now() - started) / 1000)} s)`;
+                    if (err.retry && n > 1) {
+                        err.message += ` (gave up after ${n} tries in ${Math.round((Date.now() - started) / 1000)} s)` +
+                            `${GIVE_UP_HINTS[kind] ? `; ${GIVE_UP_HINTS[kind]}` : ''}`;
+                    }
                     throw err;
                 }
                 kinds[kind] = (kinds[kind] || 0) + 1;

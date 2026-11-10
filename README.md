@@ -182,8 +182,9 @@ The gateway lets each API key have 6 requests in flight and answers the rest wit
 
 A request is sent again, up to 5 more times, when:
 
-- the gateway answers 429 for a busy key, or 502 or 503 (`upstream_unreachable`, `upstream_error`). A quota 429 (`quota_exceeded`) or a wait over 60 s fails at once.
+- the gateway answers 429 for a busy key, or 502 or 503 (`upstream_error`, `upstream_unavailable`; for 502 `upstream_unreachable` see below). A quota 429 (`quota_exceeded`) or a wait over 60 s fails at once.
 - the gateway answers 504 (`upstream_timeout`): at most 2 retries. A 500 (`internal_error`): at most 1.
+- the gateway answers 502 `upstream_unreachable` (the connection to the model server was reset before it answered): at most 2 retries. A reset that a network filter triggers on the request's content fails the same way every time, so when these retries run out the error adds: "the same request was reset every time; if the prompt or files contain text a network filter may block (e.g. shell_exec( ), that is the likely cause". Other 502s and 503s keep the normal cap.
 - no response headers arrive within 180 s (`WARRIORGPT_HEADER_TIMEOUT_MS`; it must stay above the gateway's own 30 s wait for a free slot plus the time a long prompt takes to start), or the stream sends nothing for 120 s (`WARRIORGPT_IDLE_TIMEOUT_MS`, reset on every chunk). These share the 504 cap of 2 retries. There is no limit on the total time a stream may run.
 - the connection fails (`fetch failed`, `ECONNRESET`, `ECONNREFUSED`, `socket hang up`, `terminated`), before the reply or in the middle of it. Requests are stateless, so the retry starts over. Certificate errors are not retried.
 - the stream is cut short: the gateway's `upstream_stream_incomplete` error event, a stream that closes without a finish reason, or one whose finish reason is anything but `stop`, `length` or `tool_calls` (for example `incomplete`). Nothing from a cut reply is used.
