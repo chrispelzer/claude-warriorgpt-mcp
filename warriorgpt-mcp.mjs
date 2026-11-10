@@ -22,7 +22,11 @@ const TOOL = {
         'With verify, structuredContent carries verified: true when the self-check finished, false when it ran out ' +
         'of steps; either way the files pass the check. ' +
         'This call blocks until it finishes; for checked or multi-attempt tasks, run the warriorgpt-ask ' +
-        'CLI with Bash in the background instead. Review what it wrote.',
+        'CLI with Bash in the background instead. Jobs pass fastest with the acceptance tests written first and ' +
+        'passed as check, and with a big change split into small tasks that each name their files and context_files. ' +
+        'A "warning:" line in the result means the problem is probably not the model\'s code (the check tests the ' +
+        'real tree instead of the copy, fails the same way whatever the edits, or the thinking budget ran out). ' +
+        'Review the diff: a passing check is not a review.',
     inputSchema: {
         type: 'object',
         properties: {
@@ -61,16 +65,16 @@ const TOOL = {
             loop: { type: 'boolean', description: 'With check: after a missed first attempt, switch to the tool loop (default true). false retries whole replies instead (max_attempts).' },
             parallel: { type: 'integer', description: 'With check: one-shot attempts sent at once, each checked in its own copy of the tree, raced by the loop lane from the start; the first to pass wins and the rest are cancelled (default 1, max 6).' },
             loop_lane: { type: 'boolean', description: 'With check: a tool-loop lane races the one-shot attempts from the start, in its own copy of the tree (default true). false: the one-shot attempts go first, then the loop starts from their best.' },
-            max_steps: { type: 'integer', description: 'With check: tool-loop steps after a missed first attempt (default 30, max 40).' },
+            max_steps: { type: 'integer', description: 'With check: tool-loop steps (default 30, max 40). Raise it when a result says the loop used all its steps.' },
             verify: { type: 'boolean', description: 'With check: after it passes, the model tests the spec rules the check does not cover with its own node:assert snippets and fixes genuine failures (default false). If it cannot finish, its changes are undone.' },
             max_attempts: { type: 'integer', description: 'With check and loop: false: attempts before giving up (default 3, max 5).' },
-            check_timeout_s: { type: 'integer', description: 'With check: seconds before a run is killed (default 300).' },
+            check_timeout_s: { type: 'integer', description: 'With check: seconds before a run is killed (default 300, max 3600). Slow suites (PHP, a full pytest run) may need more.' },
             temperature: { type: 'number', description: "Temperature for the first attempt. Default 0.6 for Qwen models (sent with Qwen's recommended top_p, top_k and presence penalty); the server's own for others." },
             retry_temperature_step: { type: 'number', description: 'With check: added to the temperature on each retry, capped at 0.8 (default 0.1; 0 keeps it flat).' },
             log_file: { type: 'string', description: 'Absolute path. Every reply and check output is appended there, for diagnosing a miss.' },
             max_tokens: { type: 'integer', description: 'Max output tokens for the first reply (default 16384).' },
             loop_max_tokens: { type: 'integer', description: 'Max output tokens per tool-loop or verify step (default 8192).' },
-            think_budget: { type: 'integer', description: 'Edit tasks: once a reply has thought this many tokens with nothing written, it is cut off and the model is asked for the edits with its analysis so far (default 4096; 0 = no budget).' },
+            think_budget: { type: 'integer', description: 'Edit tasks: once a reply has thought this many tokens with nothing written, it is cut off and the model is asked for the edits with its analysis so far, with the budget doubled on each retry up to 16384 (default 4096; 0 = no budget).' },
             loop_think_budget: { type: 'integer', description: 'The same for tool-loop and verify steps (default 1536).' },
             loop_thinking: { type: 'string', enum: ['auto', 'on', 'off'], description: 'Ask the server to skip thinking in loop steps: auto after a runaway (default), off always, on never.' },
         },
