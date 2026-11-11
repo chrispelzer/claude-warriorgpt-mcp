@@ -69,8 +69,10 @@ test('--no-loop-lane stops the tool-loop lane from racing the one-shot attempts'
 
     writeFileSync(one, 'start\n');
     const onLog = join(dir, 'requests-on.jsonl');
+    // The lane copies the tree before it asks, so an instant reply can pass and cancel it first (slow Windows
+    // runners do); a held-back reply gives the lane time to send its request.
     const on = ask(['--prompt-file', prompt, '--files', one, '--check', check],
-        { replies: [reply, reply], env: { MOCK_REQUEST_LOG: onLog } });
+        { replies: [{ content: reply, delay_ms: 1500 }], env: { MOCK_REQUEST_LOG: onLog, MOCK_STREAM: '1' } });
     assert.equal(on.code, 0, on.err);
     assert.ok(count(onLog) > 1, 'by default the lane races the one-shot attempt');
 });
