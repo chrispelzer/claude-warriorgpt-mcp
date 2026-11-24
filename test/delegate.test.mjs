@@ -65,7 +65,7 @@ test('write mode commits on a dl/ branch in a worktree', () => {
     assert.equal(after(log.argv, '--agent'), 'delegate-worker');
     assert.match(log.brief, /Do the thing\./);
     assert.match(log.brief, /Branch: dl\/t1/);
-    assert.ok(log.config.providers.warriorgpt);
+    assert.ok(log.config.provider.warriorgpt);
     assert.equal(log.config.plugins, undefined);
     assert.match(log.config.instructions[0], /WORKER_RULES\.md$/);
 
