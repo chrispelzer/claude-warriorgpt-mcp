@@ -202,6 +202,5 @@ In a git repository, start Claude Code and give it a small, concrete task, for e
 | `warriorgpt-delegate` exits 1 with an `opencode` error | Check `opencode --version` is 2 or newer, and look at the `stderr` log in the run folder. |
 | "branch dl/<name> already exists" | An earlier run used that name. Merge or delete it (step 4), or pick another `--name`. |
 | 429 / `quota_exceeded` | WarriorGPT rate limit or quota. Wait and retry, or let Claude do the task itself. |
-| Laguna errors | Laguna S 2.1 is not reachable on the gateway yet (it returns 500). The runner exits 3 for it. |
 | `warrior-coder` not found | The file is not in `~/.claude/agents/`, or Claude Code was not restarted after creating it. |
-| OpenCode rejects the config | Your OpenCode version uses the older key names; see the note under step 3. |
+| OpenCode rejects the config | The worker config uses OpenCode's `provider`, `npm` and `options` key names, tested on OpenCode 2.3.2. Check `opencode --version` and the `stderr` log in the run folder. |

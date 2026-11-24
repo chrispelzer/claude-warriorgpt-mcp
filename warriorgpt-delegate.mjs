@@ -248,10 +248,12 @@ const env = {
     ...(key && { WARRIORGPT_API_KEY: key }),
 };
 // Only WarriorGPT may reach a model: drop every other provider's credentials from the worker's environment.
+// Windows variable names are case-insensitive, so compare in upper case.
 for (const k of Object.keys(env)) {
-    if ((k.endsWith('_API_KEY') && k !== 'WARRIORGPT_API_KEY') ||
+    const u = k.toUpperCase();
+    if ((u.endsWith('_API_KEY') && u !== 'WARRIORGPT_API_KEY') ||
         ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_BEARER_TOKEN_BEDROCK',
-         'GOOGLE_APPLICATION_CREDENTIALS', 'OPENCODE_CONFIG_CONTENT'].includes(k)) delete env[k];
+         'GOOGLE_APPLICATION_CREDENTIALS', 'OPENCODE_CONFIG_CONTENT'].includes(u)) delete env[k];
 }
 
 const agent = mode === 'read' ? 'delegate-reader' : 'delegate-worker';
