@@ -170,6 +170,36 @@ test('a check that times out says how to give it longer', () => {
     assert.equal(r.json.warnings, undefined, 'one run is not a pattern');
 });
 
+test('a timed-out check hands the model the cut-off note in the retry prompt', () => {
+    const { one, prompt } = setup();
+    writeFileSync(join(dir, 'slow.mjs'), 'setTimeout(() => {}, 5000);\n');
+    const logFile = join(dir, 'requests.jsonl');
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', `"${process.execPath}" slow.mjs`, '--no-loop', '--max-attempts', '2',
+        '--check-timeout', '1'],
+        { replies: [block(one, edit('start', 'bad')), block(one, edit('bad', 'worse'))], env: { MOCK_REQUEST_LOG: logFile } });
+    assert.equal(r.code, 4);
+    const reqs = readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.equal(reqs.length, 2, 'two attempts, one request each');
+    // The second request carries the retry prompt with the timed-out output.
+    const retry = reqs[1].messages.at(-1);
+    assert.equal(retry.role, 'user');
+    assert.match(retry.content, /timed out after 1s\. Output:\nThe check was killed after 1 s; its output is cut off, so the runner's summary and failure details are missing\./);
+    assert.match(retry.content, /A hang often means a timer, socket or server left open, or an awaited event that never fires\./);
+    assert.doesNotMatch(retry.content, /run_node/, 'the one-shot retry has no tools');
+});
+
+test('when every check run timed out, the warning names a hang instead of a broken check', () => {
+    const { one, prompt } = setup();
+    writeFileSync(join(dir, 'slow.mjs'), 'setTimeout(() => {}, 5000);\n');
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', `"${process.execPath}" slow.mjs`, '--no-loop', '--max-attempts', '2',
+        '--check-timeout', '1'], { replies: [block(one, edit('start', 'bad')), block(one, edit('bad', 'worse'))] });
+    assert.equal(r.code, 4);
+    assert.match(r.out, /warning: all 2 check runs timed out after 1 s: the check may hang \(an open handle or a test that never ends\); a runner flag that forces exit, or a per-test timeout, makes it report failures/);
+    assert.doesNotMatch(r.out, /the check setup may be wrong/);
+    assert.equal(r.json.warnings.length, 1);
+    assert.match(r.json.warnings[0], /timed out after 1 s: the check may hang/);
+});
+
 test('a request over the context window stops at once with what to change, and leaves the files alone', () => {
     const { one, prompt, check } = setup();
     const env = { MOCK_STATUS: '400', MOCK_ERROR_BODY: '{"error":{"code":"context_length_exceeded","message":"too many tokens"}}' };
