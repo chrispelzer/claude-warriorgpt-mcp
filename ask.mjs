@@ -1,6 +1,6 @@
 // The ask_warriorgpt core, shared by the MCP server and the warriorgpt-ask CLI.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync, lstatSync } from 'node:fs';
 import { dirname, resolve, join, sep, delimiter, isAbsolute } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
 import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow } from './loop.mjs';
@@ -598,7 +598,13 @@ export function checkProgram(command) {
 export function programFound(program, cwd, env = process.env, platform = process.platform) {
     if (/^node(\.exe)?$/i.test(program) || program === process.execPath) return true;
     const exts = platform === 'win32' ? ['', ...(env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')] : [''];
-    const tryAt = (base) => exts.some((e) => existsSync(base + e));
+    // A Windows app execution alias is a reparse point to a missing target: existsSync (which follows links)
+    // reports it absent while lstat sees it, so either one counts as present.
+    const present = (p) => {
+        if (existsSync(p)) return true;
+        try { lstatSync(p); return true; } catch { return false; }
+    };
+    const tryAt = (base) => exts.some((e) => present(base + e));
     if (/[/\\]/.test(program)) return tryAt(isAbsolute(program) ? program : resolve(cwd, program));
     return (env.PATH || env.Path || '').split(delimiter).filter(Boolean).some((d) => tryAt(join(d, program)));
 }
