@@ -1,7 +1,7 @@
 // The ask_warriorgpt core, shared by the MCP server and the warriorgpt-ask CLI.
 
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
-import { dirname, resolve, join, sep, delimiter, isAbsolute } from 'node:path';
+import { dirname, resolve, join, relative, sep, delimiter, isAbsolute } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
 import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow } from './loop.mjs';
 import { makeCopy, inside, CantCopyError, copyEnv, probeCopy, sameFailure } from './workspace.mjs';
@@ -688,6 +688,9 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     const loopLane = loop && args.loop_lane !== false && args.loop_lane !== 'false';
     const maxSteps = Math.min(Math.max(Number(args.max_steps) || DEFAULT_STEPS, 1), MAX_STEPS);
     const checkTimeout = Math.min(Math.max(Number(args.check_timeout_s) || 300, 1), 3600);
+    // When the check never passes, save the closest state's versions of the files here instead of losing them.
+    const keepFailed = args.keep_failed ? resolve(args.keep_failed) : null;
+    if (keepFailed && !check) throw new UsageError('keep_failed needs check: there is nothing that can fail without it.');
     const { dir: cwd, why: cwdWhy } = args.cwd ? { dir: resolve(args.cwd), why: 'as given' }
         : files.length ? defaultCwd(files) : { dir: process.cwd(), why: 'the current folder' };
     if (check && !existsSync(cwd)) throw new UsageError(`cwd does not exist: ${cwd}`);
@@ -1028,10 +1031,11 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                         'and call done when it passes.',
                 });
                 if (signal.aborted) return { cancelled: true };
-                const contents = res.passed ? new Map(files.map((f) => {
+                // The lane's final versions of the allowed files, kept even when it fails: keep_failed may save them.
+                const contents = new Map(files.map((f) => {
                     const c = copy.to(f);
                     return [f, existsSync(c) ? readFileSync(c) : null];
-                })) : null;
+                }));
                 say(`--- loop lane ${res.passed ? `passed at step ${res.steps}` : `out of steps after ${res.steps}`} (in a copy of the tree)`);
                 return { res, contents };
             } catch (err) {
@@ -1050,7 +1054,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         stop?.addEventListener('abort', onStop, { once: true });
         brokenStop.signal.addEventListener('abort', onStop, { once: true });
         const lanePromise = loopLane ? runLane().then((r) => {
-            if (r.contents && winner === null) {
+            if (r.res?.passed && winner === null) {
                 winner = 'loop';
                 ctls.forEach((c) => c.abort());
             } else if (r.cancelled) log('--- [loop] cancelled: a one-shot attempt passed');
@@ -1081,12 +1085,14 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     const budgetAt = (n) => Math.min(thinkBudget * 2 ** n, Math.max(thinkBudget, MAX_THINK_BUDGET));
     let steps = 0;
     let passed = null;
+    let raced = null;
+    let best = null; // the closest one-shot attempt when none wins; keep_failed may save its plan
     let attemptsMade = maxAttempts;
     let laneSelfCheck = null; // the lane's own self-check, when it won with verify on
     let shotHistory = null; // the winning one-shot attempt's conversation, ending with its reply (verify continues it)
     try {
         stopped();
-        const raced = loop && files.every((f) => inside(cwd, f)) ? await raceAttempts() : null;
+        raced = loop && files.every((f) => inside(cwd, f)) ? await raceAttempts() : null;
         stopped();
         if (loop && !raced) log('=== one first attempt');
         const laneDone = !!(raced?.lane && !raced.lane.cancelled);
@@ -1119,7 +1125,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             // No winner: the closest attempt seeds the loop, the one that thought longest breaking ties; the loop's first
             // step then gets a thinking budget near what the longest thinker used.
             const live = raced.results.filter((r) => !r.cancelled);
-            const best = won || [...live].sort((a, b) => a.score - b.score || (b.thought || 0) - (a.thought || 0) || a.i - b.i)[0];
+            best = won || [...live].sort((a, b) => a.score - b.score || (b.thought || 0) - (a.thought || 0) || a.i - b.i)[0];
             if (!won) {
                 // What an attempt that finished its thinking (and wrote edits) used; if none did, the most any spent.
                 const finished = live.filter((r) => r.plan);
@@ -1270,6 +1276,42 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     }
 
     if (!passed) {
+        let kept = null;
+        let keptLabel = null;
+        if (keepFailed) {
+            // The closest state: the loop lane's final tree when its last check failed fewer tests than the best
+            // one-shot attempt (or no attempt was scored), otherwise the best one-shot plan.
+            const laneRes = raced?.lane?.res || null;
+            const laneScore = laneRes?.lastOutput
+                ? (laneRes.lastOutput.startsWith('PASSED') ? 0 : failCount(laneRes.lastOutput)) : null;
+            const shotScore = best?.score ?? null;
+            const takeLane = !!laneRes && (shotScore == null || shotScore >= 1e6 || laneScore < shotScore);
+            const state = takeLane
+                ? { label: `loop lane, step ${laneRes.steps}`, score: laneScore, output: laneRes.lastOutput, save: () => {
+                    for (const [f, buf] of raced.lane.contents) {
+                        if (buf === null) continue; // deleted or never created in that state
+                        const out = join(keepFailed, relative(cwd, f));
+                        mkdirSync(dirname(out), { recursive: true });
+                        writeFileSync(out, buf);
+                    }
+                } }
+                : best?.plan ? { label: `attempt a${best.i + 1}`, score: best.ran ? best.score : null,
+                    output: best.ran?.output, save: () => writePlan(best.plan, (p) => join(keepFailed, relative(cwd, p))) }
+                    : null;
+            if (state) {
+                mkdirSync(keepFailed, { recursive: true });
+                state.save();
+                const md = [`# Closest attempt`, '', `Source: ${state.label}`];
+                if (state.score !== null && state.score < 1e6) md.push(`Failing tests: ${state.score}`);
+                md.push(`Check: \`${check}\``, '');
+                if (state.output !== undefined) md.push('Last check output:', '', '```', headTail(state.output) || '(no output)', '```');
+                else md.push('No check output: no check ran in that state.');
+                writeFileSync(join(keepFailed, 'CLOSEST.md'), `${md.join('\n')}\n`);
+                kept = keepFailed;
+                keptLabel = state.label;
+                log(`--- kept the closest attempt (${state.label}) in ${kept}`);
+            }
+        }
         restore();
         const tried = `${attemptsMade} attempt${attemptsMade === 1 ? '' : 's'}${steps ? ` and ${steps} tool-loop steps` : ''}`;
         // Failures that are not the model's code: the check setup, the thinking budget, the step and time caps.
@@ -1300,6 +1342,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             ...(steps ? { steps } : {}),
             usage: { ...total },
             files: [],
+            ...(kept ? { kept, kept_source: keptLabel } : {}),
         };
     }
 
