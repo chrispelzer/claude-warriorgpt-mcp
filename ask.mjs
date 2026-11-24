@@ -785,6 +785,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         return ran;
     };
     const warnings = [];
+    const blockedPaths = new Set(); // files the loop was refused edits to: not in the allowed list
     const warn = (text) => {
         warnings.push(text);
         log(`!!! WARNING: ${text}`);
@@ -1241,6 +1242,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         if (!passed && laneDone && !raced.laneWon) {
             // The loop lane already ran its steps alongside the attempts: no second loop.
             const lane = raced.lane;
+            (lane.res?.blocked || []).forEach((b) => blockedPaths.add(b));
             if (lane.res?.lastOutput) lastFailure = `check ${headTail(lane.res.lastOutput)}`;
             else if (lane.error) lastFailure = `${lastFailure ? `${lastFailure}\n` : ''}the loop lane stopped: ${lane.error.message}`;
             if (lane.res && lane.res.steps >= maxSteps) outOfSteps = true;
@@ -1253,6 +1255,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                 'Find the cause and fix it with the tools until the check passes, then call done.', maxSteps);
             steps += res.steps;
             stopped();
+            (res.blocked || []).forEach((b) => blockedPaths.add(b));
             if (res.passed) {
                 passed = { attempts: attemptsMade, loop: true, head: `check passed in the tool loop at step ${res.steps} of ${maxSteps} ` +
                     `(${attemptsMade > 1 ? `${attemptsMade} parallel attempts` : 'attempt 1'} missed): ${check}${res.summary ? `\n${res.summary}` : ''}` };
@@ -1277,6 +1280,10 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         if (same) {
             warn(`all ${same} check runs failed with the same output, whatever the edits: the check setup may be wrong ` +
                 '(for example, it is not testing the edited copy). Fix the check before handing the task on.');
+        }
+        if (blockedPaths.size) {
+            warn(`the model tried to change files outside the allowed list: ${[...blockedPaths].join(', ')}. The task needs them: ` +
+                'add them to the files list (a path that does not exist yet is created) and run again; a run with the same list will fail the same way.');
         }
         if (outOfThinking.length) {
             warn(`${outOfThinking.join(', ')} ran out of thinking budget before writing any file, with the budget doubled ` +

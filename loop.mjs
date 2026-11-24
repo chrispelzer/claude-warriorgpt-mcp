@@ -23,6 +23,9 @@ const OLD_RESULT_CHARS = 300;
 const OLD_ARGS_CHARS = 1500;
 // A model that keeps answering in prose instead of calling tools is stopped after this many replies in a row.
 const MAX_PROSE = 3;
+// Edits to files outside the allowed list that end a fix loop: the task needs files the caller did not list, and no
+// number of further steps changes that.
+const MAX_REFUSED_EDITS = 3;
 // A step whose reasoning took more than this share of its output budget, without a tool call, is a runaway.
 const RUNAWAY_SHARE = 0.9;
 
@@ -245,6 +248,7 @@ async function loop(ctx, saved) {
     const snapshot = () => new Map(ctx.files.map((f) => [f, existsSync(f) ? readFileSync(f) : null]));
     const sameBytes = (a, b) => (a === null || b === null ? a === b : a.equals(b));
     let edits = 0;
+    const refusedPaths = [];
     let lastCheck = { ok: false, at: -1, output: '' };
     let probes = 0;
     let doneRefusals = 0;
@@ -287,6 +291,7 @@ async function loop(ctx, saved) {
             }
             const target = matchAllowed(resolve(ctx.cwd, path), ctx.files) || matchAllowed(path, ctx.files);
             if (!target) {
+                refusedPaths.push(path);
                 return `error: ${path} is not a file you may change; it is read-only. Allowed: ${ctx.files.join(', ')}. ` +
                     'Put the change in one of those files instead.';
             }
@@ -481,6 +486,12 @@ async function loop(ctx, saved) {
             });
             if (group.length > 1) ctx.log(`--- ${group.length} read-only calls ran at once`);
             i = j;
+        }
+        if (mode === 'fix' && !finished && refusedPaths.length >= MAX_REFUSED_EDITS && !fixEnd && !(await passingNow())) {
+            const blocked = [...new Set(refusedPaths.map((p) => relative(ctx.cwd, resolve(ctx.cwd, p)) || p))];
+            ctx.log(`--- fix loop stopped: ${refusedPaths.length} edits to files outside the allowed list (${blocked.join(', ')}); ` +
+                'the task needs files the caller did not list');
+            return { passed: false, finished: false, steps: step, summary: '', lastOutput: lastCheck.output, edits, blocked };
         }
         // done was checked against the files before any edit that came after it in the same reply.
         if (finished && finished.at !== edits) {
