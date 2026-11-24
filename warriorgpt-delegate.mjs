@@ -17,11 +17,19 @@ import { API_BASE, DEFAULT_MODEL, STATE_DIR, SESSION, apiKey, missingKeyMessage 
 const DELEGATE_DIR = join(dirname(fileURLToPath(import.meta.url)), 'delegate');
 const EXCLUDED = new Set(['node_modules', '.git', 'vendor', '.claude', '.pnpm-store', '__pycache__']);
 
+// The WarriorGPT models the package knows; an id not listed here still gets a provider entry when it is passed.
+const WARRIORGPT_MODELS = {
+    'local.qwen3.8-27b': { name: 'Qwen 3.8 27B', tool_call: true, reasoning: true, interleaved: 'reasoning', temperature: true, attachment: true, modalities: { input: ['text', 'image'], output: ['text'] }, limit: { context: 112000, output: 16384 }, options: { temperature: 0.6, top_p: 0.95, top_k: 20, presence_penalty: 1.2 } },
+    'local.gpt-oss-120b': { name: 'GPT-OSS 120B', tool_call: true, reasoning: true, interleaved: 'reasoning', temperature: true, attachment: false, limit: { context: 131072, output: 32768 } },
+    'local.gemma-4-31b': { name: 'Gemma 4 31B', tool_call: true, reasoning: true, interleaved: 'reasoning', temperature: true, attachment: true, modalities: { input: ['text', 'image'], output: ['text'] }, limit: { context: 131072, output: 32768 } },
+    'local.laguna-s-2.1': { name: 'Laguna S 2.1', tool_call: true, reasoning: true, interleaved: 'reasoning', temperature: true, attachment: false, limit: { context: 131072, output: 32768 } },
+};
+
 const USAGE = `Usage: warriorgpt-delegate --name <task> --brief <file> [options]
 
   --name <task>          task id: lower-case letters, digits, dashes
   --brief <file>         the brief; it must stand alone, the worker sees nothing else
-  --model <id>           provider/model or a bare WarriorGPT id (default warriorgpt/${DEFAULT_MODEL})
+  --model <id>           a WarriorGPT model id, warriorgpt/ prefix optional (default ${DEFAULT_MODEL})
   --mode write|read      write (default) changes files; read answers a question and changes nothing
   --dir <path>           project folder (default: current directory)
   --base <ref>           commit the worktree starts from (default HEAD)
@@ -71,27 +79,31 @@ if (opts.help) {
     process.exit(0);
 }
 
-const model = opts.model?.includes('/') ? opts.model : `warriorgpt/${opts.model || DEFAULT_MODEL}`;
-const [provider, modelId] = [model.slice(0, model.indexOf('/')), model.slice(model.indexOf('/') + 1)];
+// --model is a WarriorGPT model id, with or without the warriorgpt/ prefix; anything else is refused at once.
+let modelId = opts.model || DEFAULT_MODEL;
+if (modelId.includes('/')) {
+    const prefix = modelId.slice(0, modelId.indexOf('/'));
+    if (prefix !== 'warriorgpt') fail(2, `--model must be a WarriorGPT model (warriorgpt/<id> or <id>); got ${opts.model}`);
+    modelId = modelId.slice(modelId.indexOf('/') + 1);
+}
+const model = `warriorgpt/${modelId}`;
 const key = apiKey();
-if (provider === 'warriorgpt' && !key) fail(1, missingKeyMessage());
+if (!key) fail(1, missingKeyMessage());
 
 // --- probe: one tiny chat request ---------------------------------------------------------------------------
-if (provider === 'warriorgpt') {
-    let probeErr = null;
-    try {
-        const res = await fetch(`${API_BASE}/chat/completions`, {
-            method: 'POST',
-            headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: modelId, max_tokens: 16, messages: [{ role: 'user', content: 'Reply with OK.' }] }),
-            signal: AbortSignal.timeout(60 * 1000),
-        });
-        if (!res.ok) probeErr = `${res.status} ${(await res.text()).slice(0, 200)}`;
-    } catch (err) {
-        probeErr = err.message;
-    }
-    if (probeErr) fail(3, `${model} does not answer: ${probeErr}. Use another model.`);
+let probeErr = null;
+try {
+    const res = await fetch(`${API_BASE}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId, max_tokens: 16, messages: [{ role: 'user', content: 'Reply with OK.' }] }),
+        signal: AbortSignal.timeout(60 * 1000),
+    });
+    if (!res.ok) probeErr = `${res.status} ${(await res.text()).slice(0, 200)}`;
+} catch (err) {
+    probeErr = err.message;
 }
+if (probeErr) fail(3, `${model} does not answer: ${probeErr}. Use another model.`);
 if (opts.probe) fail(0, `${model} answers`);
 
 // --- arguments ----------------------------------------------------------------------------------------------
@@ -109,17 +121,8 @@ const instructions = opts.instructions.map((f) => {
 // .native expands Windows 8.3 short names, so dir and gitTop compare as the same path.
 const dir = realpathSync.native(opts.dir);
 
+// The user's OpenCode config is never read: the worker gets a WarriorGPT-only config built by this file.
 const configHome = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-const globalCfgPath = join(configHome, 'opencode', 'opencode.json');
-let globalCfg;
-try {
-    globalCfg = JSON.parse(readFileSync(globalCfgPath, 'utf8'));
-} catch (err) {
-    fail(1, `cannot read the OpenCode config at ${globalCfgPath}: ${err.message}`);
-}
-// OpenCode 2 calls the block "providers", older versions "provider".
-const providerKey = globalCfg.providers ? 'providers' : 'provider';
-if (!globalCfg[providerKey]?.[provider]) fail(1, `provider ${provider} is not in ${globalCfgPath}`);
 
 const top = git(dir, 'rev-parse', '--show-toplevel');
 const gitTop = top && realpathSync.native(top);
@@ -198,15 +201,34 @@ if (opts.resume) {
 const briefPath = join(runDir, `brief_${stamp}.md`);
 writeFileSync(briefPath, `${header}\n${readFileSync(opts.brief, 'utf8')}`);
 
-// --- isolated OpenCode config: the user's providers, no plugins or MCP servers, only our instructions ---------
+// --- isolated OpenCode config: WarriorGPT only, no plugins or MCP servers, only our instructions --------------
 const cfgHome = join(STATE_DIR, 'opencode-config', `${slug}-${name}`);
 mkdirSync(join(cfgHome, 'opencode'), { recursive: true });
+// The worker's own data, state and cache folders, shared across runs so --resume finds the session in the same
+// database; nothing is copied into them, so the user's OpenCode login (auth.json) stays out of sight.
+for (const part of ['data', 'state', 'cache']) mkdirSync(join(STATE_DIR, 'opencode-home', part), { recursive: true });
 // Moving XDG_CONFIG_HOME would also hide the user's git identity from the worker's commits.
 if (existsSync(join(configHome, 'git'))) cpSync(join(configHome, 'git'), join(cfgHome, 'git'), { recursive: true });
 const cfgFile = join(cfgHome, 'opencode', 'opencode.json');
+const models = { ...WARRIORGPT_MODELS };
+if (!models[modelId]) models[modelId] = { name: modelId, tool_call: true, reasoning: true, interleaved: 'reasoning',
+    temperature: true, attachment: false, limit: { context: 131072, output: 32768 } };
 writeFileSync(cfgFile, JSON.stringify({
     $schema: 'https://opencode.ai/config.json',
-    [providerKey]: globalCfg[providerKey],
+    enabled_providers: ['warriorgpt'],
+    model: `warriorgpt/${modelId}`,
+    small_model: `warriorgpt/${modelId}`,
+    share: 'disabled',
+    autoupdate: false,
+    provider: {
+        warriorgpt: {
+            npm: '@ai-sdk/openai-compatible',
+            name: 'WarriorGPT',
+            env: ['WARRIORGPT_API_KEY'],
+            options: { baseURL: API_BASE, apiKey: '{env:WARRIORGPT_API_KEY}', setCacheKey: true, includeUsage: true },
+            models,
+        },
+    },
     instructions: [join(DELEGATE_DIR, 'WORKER_RULES.md'), ...instructions].map((p) => p.replaceAll('\\', '/')),
 }, null, 2));
 const env = {
@@ -214,14 +236,23 @@ const env = {
     // OpenCode takes its directory from PWD, which spawn's cwd does not update.
     PWD: workDir,
     XDG_CONFIG_HOME: cfgHome,
+    XDG_DATA_HOME: join(STATE_DIR, 'opencode-home', 'data'),
+    XDG_STATE_HOME: join(STATE_DIR, 'opencode-home', 'state'),
+    XDG_CACHE_HOME: join(STATE_DIR, 'opencode-home', 'cache'),
     OPENCODE_CONFIG: cfgFile,
     OPENCODE_CONFIG_DIR: join(DELEGATE_DIR, 'opencode'),
     OPENCODE_DISABLE_PROJECT_CONFIG: '1',
     OPENCODE_DISABLE_CLAUDE_CODE: '1',
     OPENCODE_DISABLE_AUTOUPDATE: '1',
+    OPENCODE_DISABLE_MODELS_FETCH: '1',
     ...(key && { WARRIORGPT_API_KEY: key }),
 };
-delete env.OPENCODE_CONFIG_CONTENT;
+// Only WarriorGPT may reach a model: drop every other provider's credentials from the worker's environment.
+for (const k of Object.keys(env)) {
+    if ((k.endsWith('_API_KEY') && k !== 'WARRIORGPT_API_KEY') ||
+        ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_BEARER_TOKEN_BEDROCK',
+         'GOOGLE_APPLICATION_CREDENTIALS', 'OPENCODE_CONFIG_CONTENT'].includes(k)) delete env[k];
+}
 
 const agent = mode === 'read' ? 'delegate-reader' : 'delegate-worker';
 // --standalone: the background service would ignore this process's config.
