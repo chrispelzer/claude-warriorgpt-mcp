@@ -1087,6 +1087,11 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     let passed = null;
     let raced = null;
     let best = null; // the closest one-shot attempt when none wins; keep_failed may save its plan
+    // The real tree's state when work was done in place (sequential attempts, or the tool loop after the one-shot
+    // plans were written there): keep_failed may save it as the closest state.
+    let treeTouched = false;
+    let treeLabel = '';
+    let treeOutput = '';
     let attemptsMade = maxAttempts;
     let laneSelfCheck = null; // the lane's own self-check, when it won with verify on
     let shotHistory = null; // the winning one-shot attempt's conversation, ending with its reply (verify continues it)
@@ -1233,6 +1238,10 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             const ran = throwIfBroken(noteCheck(await runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd))));
             stopped();
             log(`--- attempt ${attempt}: check ${ran.ok ? 'passed' : ran.timedOut ? 'timed out' : `failed (exit ${ran.code})`}\n${tail(ran.output, 20000)}`);
+            // The attempt's edits are in the real tree and were checked there: the tree is a candidate for keep_failed.
+            treeTouched = true;
+            treeLabel = `working tree after attempt ${attempt}`;
+            treeOutput = ran.output;
             if (ran.ok) {
                 passed = { attempts: attempt, loop: false, head: `check passed on attempt ${attempt} of ${maxAttempts}: ${check}\n` +
                     summary.replace(/\n\([^\n]*\)$/, '') };
@@ -1266,6 +1275,13 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                 // The loop's own last check run, if it ran one; otherwise the one-shot failure still stands.
                 if (res.lastOutput) lastFailure = `check ${headTail(res.lastOutput)}`;
                 if (res.steps >= maxSteps) outOfSteps = true;
+                // The loop worked on the real tree from the best one-shot plan: when it changed anything, its final
+                // state is newer than the plan and a candidate for keep_failed.
+                if (res.edits > 0) {
+                    treeTouched = true;
+                    treeLabel = `working tree after tool-loop step ${res.steps}`;
+                    if (res.lastOutput) treeOutput = res.lastOutput;
+                }
             }
         }
     } catch (err) {
@@ -1279,25 +1295,33 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         let kept = null;
         let keptLabel = null;
         if (keepFailed) {
-            // The closest state: the loop lane's final tree when its last check failed fewer tests than the best
-            // one-shot attempt (or no attempt was scored), otherwise the best one-shot plan.
+            // The closest state, by fewest failing tests: the working tree when work was done in place, the loop
+            // lane's final tree when it ran, or the best one-shot plan. A scored state always beats an unscored one;
+            // with no scored state, the first candidate in that order stands.
+            const scoreOf = (output) => (output ? (output.startsWith('PASSED') ? 0 : failCount(output)) : null);
+            const candidates = [];
+            if (treeTouched) candidates.push({ label: treeLabel, output: treeOutput, save: () => {
+                for (const f of files) {
+                    if (!existsSync(f)) continue;
+                    const out = join(keepFailed, relative(cwd, f));
+                    mkdirSync(dirname(out), { recursive: true });
+                    writeFileSync(out, readFileSync(f));
+                }
+            } });
             const laneRes = raced?.lane?.res || null;
-            const laneScore = laneRes?.lastOutput
-                ? (laneRes.lastOutput.startsWith('PASSED') ? 0 : failCount(laneRes.lastOutput)) : null;
-            const shotScore = best?.score ?? null;
-            const takeLane = !!laneRes && (shotScore == null || shotScore >= 1e6 || laneScore < shotScore);
-            const state = takeLane
-                ? { label: `loop lane, step ${laneRes.steps}`, score: laneScore, output: laneRes.lastOutput, save: () => {
-                    for (const [f, buf] of raced.lane.contents) {
-                        if (buf === null) continue; // deleted or never created in that state
-                        const out = join(keepFailed, relative(cwd, f));
-                        mkdirSync(dirname(out), { recursive: true });
-                        writeFileSync(out, buf);
-                    }
-                } }
-                : best?.plan ? { label: `attempt a${best.i + 1}`, score: best.ran ? best.score : null,
-                    output: best.ran?.output, save: () => writePlan(best.plan, (p) => join(keepFailed, relative(cwd, p))) }
-                    : null;
+            if (laneRes) candidates.push({ label: `loop lane, step ${laneRes.steps}`, output: laneRes.lastOutput, save: () => {
+                for (const [f, buf] of raced.lane.contents) {
+                    if (buf === null) continue; // deleted or never created in that state
+                    const out = join(keepFailed, relative(cwd, f));
+                    mkdirSync(dirname(out), { recursive: true });
+                    writeFileSync(out, buf);
+                }
+            } });
+            if (best?.plan) candidates.push({ label: `attempt a${best.i + 1}`, output: best.ran?.output,
+                save: () => writePlan(best.plan, (p) => join(keepFailed, relative(cwd, p))) });
+            for (const c of candidates) c.score = scoreOf(c.output);
+            const scored = candidates.filter((c) => c.score !== null && c.score < 1e6);
+            const state = scored.length ? scored.reduce((a, b) => (b.score < a.score ? b : a)) : candidates[0] || null;
             if (state) {
                 mkdirSync(keepFailed, { recursive: true });
                 state.save();

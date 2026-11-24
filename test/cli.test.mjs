@@ -317,3 +317,44 @@ test('without --keep-failed nothing is saved when the check never passes', () =>
     assert.equal(existsSync(kept), false, 'nothing was written');
     assert.equal(readFileSync(one, 'utf8'), 'start\n');
 });
+
+test('--keep-failed with --no-loop saves the working tree after the last attempt', () => {
+    const { one, prompt, check } = setup();
+    const kept = join(dir, 'kept');
+    // Retries edit the current files in place: the second attempt builds on the first.
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', check, '--cwd', dir, '--no-loop', '--max-attempts', '2',
+        '--keep-failed', kept], { replies: [block(one, edit('start', 'first')), block(one, edit('first', 'second'))] });
+    assert.equal(r.code, 4, r.err);
+    assert.equal(r.json.kept, kept);
+    assert.ok(r.err.includes(`kept the closest attempt (working tree after attempt 2) in ${kept}`), r.err);
+    assert.equal(readFileSync(one, 'utf8'), 'start\n', 'the real file was restored');
+    assert.equal(readFileSync(join(kept, 'one.txt'), 'utf8'), 'second\n', 'the last attempt\'s state was saved');
+    const md = readFileSync(join(kept, 'CLOSEST.md'), 'utf8');
+    assert.match(md, /Source: working tree after attempt 2/);
+    assert.match(md, /Last check output:/);
+});
+
+test('--keep-failed saves the tool loop\'s work in the real tree, not the one-shot plan it started from', () => {
+    const { one, prompt, check } = setup();
+    writeFileSync(join(dir, 'check.mjs'), "import { readFileSync } from 'node:fs';\n" +
+        "const t = readFileSync(new URL('./one.txt', import.meta.url), 'utf8');\n" +
+        "const missing = ['alpha', 'beta', 'gamma'].filter((w) => !t.includes(w));\n" +
+        "console.log('\u2139 fail ' + missing.length + (missing.length ? ' missing: ' + missing.join(' ') : ''));\n" +
+        'process.exit(missing.length ? 1 : 0);\n');
+    const kept = join(dir, 'kept');
+    // Lane off: the one-shot attempt misses all three words, then the tool loop works on in the real tree from it.
+    writeFileSync(join(dir, 'routes.json'), JSON.stringify({
+        '"tools"': [{ tool_calls: [{ name: 'edit', arguments: { path: 'one.txt', search: 'shot-edit', replace: 'alpha beta' } }] },
+            { tool_calls: [{ name: 'run_check', arguments: {} }] }],
+        '"max_tokens":16384': [block(one, edit('start', 'shot-edit'))],
+    }));
+    const r = ask(['--prompt-file', prompt, '--files', one, '--check', check, '--cwd', dir, '--no-loop-lane', '--max-steps', '3',
+        '--keep-failed', kept], { replies: [], env: { MOCK_ROUTES: join(dir, 'routes.json') } });
+    assert.equal(r.code, 4, r.err);
+    assert.equal(r.json.kept, kept);
+    assert.equal(readFileSync(one, 'utf8'), 'start\n', 'the real file was restored');
+    assert.equal(readFileSync(join(kept, 'one.txt'), 'utf8'), 'alpha beta\n', 'the tool loop\'s state was saved');
+    const md = readFileSync(join(kept, 'CLOSEST.md'), 'utf8');
+    assert.match(md, /Source: working tree after tool-loop step \d+/);
+    assert.match(md, /Failing tests: 1/);
+});
