@@ -221,8 +221,7 @@ async function runAskJob(args, ctx) {
     const name = taskName('fb');
     ctx.onLog?.(`=== OpenCode fallback: ${name} takes over in ${root}`);
     const oc = await runOpenCode({ brief: fallbackBrief({ prompt: args.prompt, files, check: args.check, cwd, root,
-        failure: res.text }), dir: root, mode: 'write', name, ...(args.model ? { model: args.model } : {}) }, ctx,
-        { env: OC_CHILD_ENV });
+        failure: res.text }), dir: root, mode: 'write', name, ...(args.model ? { model: args.model } : {}) }, ctx);
     return { ...oc, fallback: 'opencode', ask: { attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}) },
         text: `${res.text}\n\n--- OpenCode fallback ---\n${oc.text}` };
 }
@@ -232,11 +231,8 @@ const ocEnvMax = () => {
     const n = Number(process.env.WARRIORGPT_MAX_OPENCODE_JOBS);
     return Number.isInteger(n) && n >= 1 ? n : 2;
 };
-// The worker's model probe never reads the reply body. A fetch mock (test/mock-fetch.mjs) answers streaming
-// requests eagerly, failing when no reply file is configured, so the child process must not inherit MOCK_STREAM.
-const OC_CHILD_ENV = { MOCK_STREAM: '' };
 const jobs = createJobs({ run: (args, ctx) => runAskJob(args, ctx) });
-const ocJobs = createJobs({ run: (args, ctx) => runOpenCode(args, ctx, { env: OC_CHILD_ENV }), maxRunning: ocEnvMax(), prefix: 'oc' });
+const ocJobs = createJobs({ run: (args, ctx) => runOpenCode(args, ctx), maxRunning: ocEnvMax(), prefix: 'oc' });
 // Ask jobs and OpenCode jobs share the polling tools; the registry that owns a job does its wait, cancel and time.
 const owner = (job) => (job.id.startsWith('oc-') ? ocJobs : jobs);
 const FINISHED = new Set(['done', 'failed', 'cancelled']);

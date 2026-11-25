@@ -47,6 +47,8 @@ afterEach(() => {
 function server(env = {}) {
     const home = join(dir, 'home');
     mkdirSync(home, { recursive: true });
+    // The delegate it starts probes the model with one streamed request, which needs a reply to stream.
+    if (!existsSync(join(dir, 'replies.json'))) writeFileSync(join(dir, 'replies.json'), JSON.stringify(['ok']));
     const child = spawn(process.execPath, ['--import', MOCK, SERVER], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, HOME: home, USERPROFILE: home, LOCALAPPDATA: home, XDG_CONFIG_HOME: join(dir, 'config'),
