@@ -1,7 +1,7 @@
 {
   "name": "claude-warriorgpt-mcp",
-  "version": "1.0.0",
-  "description": "MCP server that gives Claude Code an ask_warriorgpt tool backed by Wayne State's WarriorGPT API",
+  "version": "1.1.0",
+  "description": "MCP server that gives Claude Code ask_warriorgpt and start_opencode_job tools backed by Wayne State's WarriorGPT API",
   "type": "module",
   "bin": {
     "warriorgpt-mcp": "warriorgpt-mcp.mjs",

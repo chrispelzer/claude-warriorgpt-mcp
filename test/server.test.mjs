@@ -50,6 +50,8 @@ test('initialize and tools/list describe the tool', () => {
         { id: 2, method: 'tools/list' },
     ]);
     assert.equal(init.result.protocolVersion, '2025-06-18');
+    // The reported version is package.json's, so a release bump cannot leave it behind.
+    assert.equal(init.result.serverInfo.version, JSON.parse(readFileSync(resolve(here, '../package.json'), 'utf8')).version);
     const tool = list.result.tools[0];
     assert.equal(tool.name, 'ask_warriorgpt');
     assert.ok(tool.inputSchema.properties.files);
