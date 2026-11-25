@@ -144,6 +144,14 @@ export function headTail(text, head = HEAD_CHARS, tailN = TAIL_CHARS) {
 // The gateway's answer to a request over the model's context window.
 export const isContextOverflow = (err) => /context_length_exceeded|maximum context length/i.test(err?.message || '');
 
+// A timed-out check's output is cut before the runner's summary: tell the model what is missing, and what a
+// hang usually is, so it does not treat the cut-off failure list as the whole story.
+export function timeoutNote(seconds, runNode = false) {
+    return `The check was killed after ${seconds} s; its output is cut off, so the runner's summary and failure ` +
+        'details are missing. A hang often means a timer, socket or server left open, or an awaited event that ' +
+        `never fires.${runNode ? ' If the check is a test runner, run a single failing test file yourself with run_node to see why it fails.' : ''}`;
+}
+
 function tail(text, n) {
     return text.length > n ? `[...${text.length - n} chars cut]\n${text.slice(-n)}` : text;
 }
@@ -259,8 +267,10 @@ async function loop(ctx, saved) {
     const check = async () => {
         const ran = await ctx.runCheck();
         const why = ran.ok ? 'PASSED' : ran.timedOut ? 'TIMED OUT' : `FAILED (exit ${ran.code})`;
-        lastCheck = { ok: ran.ok, at: edits, output: `${why}\n${ran.output}` };
-        return clip(`${why}\n${ran.output}`);
+        // A timed-out run's output is cut before the runner's summary; the note says so, and what a hang usually is.
+        const note = ran.timedOut ? `${timeoutNote(ctx.checkTimeoutS ?? Math.round((ran.ms || 0) / 1000), !!ctx.runNode)}\n` : '';
+        lastCheck = { ok: ran.ok, at: edits, output: `${why}\n${note}${ran.output}` };
+        return clip(`${why}\n${note}${ran.output}`);
     };
     const passingNow = async () => (lastCheck.at === edits ? lastCheck.ok : (await check(), lastCheck.ok));
 

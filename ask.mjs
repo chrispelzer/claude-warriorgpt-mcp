@@ -3,7 +3,7 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
 import { dirname, resolve, join, sep, delimiter, isAbsolute } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
-import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow } from './loop.mjs';
+import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow, timeoutNote } from './loop.mjs';
 import { makeCopy, inside, CantCopyError, copyEnv, probeCopy, sameFailure } from './workspace.mjs';
 import { availableParallelism, homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -843,6 +843,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...contextPaths], cwd, mode,
         runCheck: () => runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd)).then(noteCheck).then(throwIfBroken), runNode: (code) => runNode(code, cwd, stop, contextPaths), log,
         maxSteps: steps, maxTokens: mode === 'verify' ? LANE_MAX_TOKENS : loopMaxTokens, onRunaway: () => { runawaySeen = true; }, system: mode === 'verify' ? VERIFY_SYSTEM : FIX_SYSTEM,
+        checkTimeoutS: checkTimeout,
         ...(history ? { history } : {}), verifyThink: VERIFY_THINK_BUDGET, verifyMs: verifyMs,
         user: history
             ? `Your edits were applied and the check passes. From here you work through tools (no more file blocks).\n\n` +
@@ -1024,6 +1025,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                     runCheck: () => checks(() => probed.then(() => runCheck(laneCheck, copy.dir, checkTimeout, signal, copyEnv(copy.dir))))
                         .then(noteCheck),
                     runNode: (code) => runNode(code, copy.dir, signal, [cwd, ...contextPaths]), onRunaway: () => { runawaySeen = true; }, system: FIX_SYSTEM,
+                    checkTimeoutS: checkTimeout,
                     user: `${args.prompt}${contextText}\n\nFiles you may change, as they are now:${now}\n\nWorking directory: ${copy.dir}\n` +
                         `Check command: ${laneCheck}\n\nMake the change with the tools: read what you need, edit, run the check, ` +
                         'and call done when it passes.',
@@ -1235,8 +1237,10 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             }
             const why = ran.timedOut ? `timed out after ${checkTimeout}s` : `failed (exit ${ran.code})`;
             const output = headTail(ran.output);
+            // A timed-out run's output is cut before the runner's summary; the note says so, and what a hang usually is.
+            const note = ran.timedOut ? `${timeoutNote(checkTimeout)}\n` : '';
             lastFailure = `check ${why}:\n${output}`;
-            retry(reply.text, `Your edits were written and \`${check}\` ${why}. Output:\n\`\`\`\n${output}\n\`\`\``);
+            retry(reply.text, `Your edits were written and \`${check}\` ${why}. Output:\n${note}\`\`\`\n${output}\n\`\`\``);
         }
 
         if (!passed && laneDone && !raced.laneWon) {
@@ -1278,8 +1282,14 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         // Failures that are not the model's code: the check setup, the thinking budget, the step and time caps.
         const same = sameFailure(checkRuns, [cwd]);
         if (same) {
-            warn(`all ${same} check runs failed with the same output, whatever the edits: the check setup may be wrong ` +
-                '(for example, it is not testing the edited copy). Fix the check before handing the task on.');
+            // Runs that all timed out the same way are a hang, not a broken check: say so instead of blaming the setup.
+            if (checkRuns.every((r) => r.timedOut)) {
+                warn(`all ${same} check runs timed out after ${checkTimeout} s: the check may hang (an open handle or a test that never ends); ` +
+                    'a runner flag that forces exit, or a per-test timeout, makes it report failures');
+            } else {
+                warn(`all ${same} check runs failed with the same output, whatever the edits: the check setup may be wrong ` +
+                    '(for example, it is not testing the edited copy). Fix the check before handing the task on.');
+            }
         }
         if (blockedPaths.size) {
             warn(`the model tried to change files outside the allowed list: ${[...blockedPaths].join(', ')}. The task needs them: ` +
