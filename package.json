@@ -22,6 +22,7 @@
     "retry.mjs",
     "warriorgpt-ask.mjs",
     "warriorgpt-delegate.mjs",
+    "opencode-jobs.mjs",
     "common.mjs",
     "delegate/",
     "warriorgpt-mode.md"

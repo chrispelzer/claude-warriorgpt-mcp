@@ -8,7 +8,10 @@ if (!process.env.WARRIORGPT_OPENCODE) process.exit(0);
 const brief = readFileSync(0, 'utf8');
 const dir = process.env.PWD;
 if (process.env.FAKE_OC_LOG) {
-    writeFileSync(process.env.FAKE_OC_LOG, JSON.stringify({ argv: process.argv.slice(2), pwd: dir, brief,
+    // The variables that decide which provider OpenCode can reach and where it looks for logins.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([k]) =>
+        /^(XDG_|OPENCODE_)|_API_KEY$|^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN|BEARER_TOKEN_BEDROCK)$|^GOOGLE_APPLICATION_CREDENTIALS$/.test(k)));
+    writeFileSync(process.env.FAKE_OC_LOG, JSON.stringify({ argv: process.argv.slice(2), pwd: dir, brief, env,
         config: JSON.parse(readFileSync(process.env.OPENCODE_CONFIG, 'utf8')) }));
 }
 

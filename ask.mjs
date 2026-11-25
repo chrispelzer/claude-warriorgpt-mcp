@@ -69,8 +69,8 @@ export const samplingFor = (model, temperature) => {
 const RETRY_TEMPERATURE_BASE = 0.6;
 // Replies that spent the whole budget thinking are retried without using up an attempt, at most this often.
 const MAX_FREE_RETRIES = 2;
-export const FALLBACK_HINT = 'fallback: opencode. Hand this task to an agent that can run the tests and read the code ' +
-    '(for example warriorgpt-delegate, or your OpenCode subagent).';
+export const FALLBACK_HINT = 'fallback: opencode. Hand this task to an OpenCode worker on WarriorGPT: start_opencode_job ' +
+    'in this MCP server (start_warriorgpt_job does it for you), or warriorgpt-delegate on the command line.';
 export const MAX_TEMPERATURE = 0.8;
 // The loop lane is the main path on hard tasks; OpenCode has no step cap, and lower caps made lanes give up too early.
 const DEFAULT_STEPS = 30;

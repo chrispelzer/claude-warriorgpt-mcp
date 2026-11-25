@@ -1,6 +1,6 @@
 # claude-warriorgpt-mcp
 
-An MCP server that gives [Claude Code](https://code.claude.com/) a tool, `ask_warriorgpt` (plus job tools to run it in the background), which calls Wayne State's [WarriorGPT](https://warriorgpt.wayne.edu/) API directly. Your Claude Code session stays on your Claude plan; only the tool call goes to WarriorGPT, so routine code generation does not count against your Claude usage.
+An MCP server that gives [Claude Code](https://code.claude.com/) tools that hand work to Wayne State's [WarriorGPT](https://warriorgpt.wayne.edu/): `ask_warriorgpt` (plus job tools to run it in the background), which calls the WarriorGPT API directly, and `start_opencode_job`, which runs an [OpenCode](https://opencode.ai/) coding agent on a WarriorGPT model in a git worktree. Your Claude Code session stays on your Claude plan; only the tool calls go to WarriorGPT, so routine code generation does not count against your Claude usage.
 
 It is plain Node with no dependencies and works on macOS, Linux, and Windows.
 
@@ -149,7 +149,7 @@ warriorgpt-ask --prompt-file brief.md --files src/a.js --files test/a.test.js \
   --context src/util.js --check "npm test" --cwd .
 ```
 
-Flags: `--prompt` or `--prompt-file`, `--files` and `--context` (repeat or comma-separate), `--check`, `--cwd`, `--parallel`, `--no-loop-lane`, `--max-steps`, `--verify`, `--no-loop`, `--max-attempts`, `--check-timeout`, `--keep-failed`, `--log`, `--output-file`, `--model`, `--system-file`, `--max-tokens`, `--loop-max-tokens`, `--think-budget`, `--loop-think-budget`, `--loop-thinking`, `--max-concurrency`, `--json`. Relative paths resolve against the current folder. It prints the result, then one JSON line `{ok, attempts, steps?, verified?, files, tokens, warnings?, kept?, ms}` (`steps` only when the tool loop ran, `verified` only with `--verify`: true when the self-check finished, false when it ran out of steps; `warnings` only when there are some, see above; `kept` only on 4 with `--keep-failed`: the folder the closest attempt was saved to). Exit codes: 0 passed (or no check), 1 the reply could not be applied (no check), 2 usage error (including a check that cannot run from `cwd`), 3 WarriorGPT unreachable or returned an error, 4 the check never passed and every file was restored. With `--keep-failed <dir>`, before the restore the closest state's versions of the `--files` paths are saved under `<dir>` (relative to the project root, plus a `CLOSEST.md` with their source, failing-test score, check command and last check output). The closest state is chosen from the loop lane's copy, the best one-shot attempt and the real working tree (after `--no-loop` retries or the in-tree tool loop), by fewest failing tests, and the JSON line also carries `"kept": "<dir>"`. On 4 the JSON line carries `"fallback": "opencode"`, and the MCP tool returns an error with `structuredContent: {ok: false, fallback: "opencode", attempts, steps}`: the task needs an agent that can run the code and read around it, so hand it to OpenCode (`warriorgpt-delegate` or an OpenCode subagent) rather than retrying the same call.
+Flags: `--prompt` or `--prompt-file`, `--files` and `--context` (repeat or comma-separate), `--check`, `--cwd`, `--parallel`, `--no-loop-lane`, `--max-steps`, `--verify`, `--no-loop`, `--max-attempts`, `--check-timeout`, `--keep-failed`, `--log`, `--output-file`, `--model`, `--system-file`, `--max-tokens`, `--loop-max-tokens`, `--think-budget`, `--loop-think-budget`, `--loop-thinking`, `--max-concurrency`, `--json`. Relative paths resolve against the current folder. It prints the result, then one JSON line `{ok, attempts, steps?, verified?, files, tokens, warnings?, kept?, ms}` (`steps` only when the tool loop ran, `verified` only with `--verify`: true when the self-check finished, false when it ran out of steps; `warnings` only when there are some, see above; `kept` only on 4 with `--keep-failed`: the folder the closest attempt was saved to). Exit codes: 0 passed (or no check), 1 the reply could not be applied (no check), 2 usage error (including a check that cannot run from `cwd`), 3 WarriorGPT unreachable or returned an error, 4 the check never passed and every file was restored. With `--keep-failed <dir>`, before the restore the closest state's versions of the `--files` paths are saved under `<dir>` (relative to the project root, plus a `CLOSEST.md` with their source, failing-test score, check command and last check output). The closest state is chosen from the loop lane's copy, the best one-shot attempt and the real working tree (after `--no-loop` retries or the in-tree tool loop), by fewest failing tests, and the JSON line also carries `"kept": "<dir>"`. On 4 the JSON line carries `"fallback": "opencode"`, and the MCP tool returns an error with `structuredContent: {ok: false, fallback: "opencode", attempts, steps}`: the task needs an agent that can run the code and read around it. A `start_warriorgpt_job` hands it to an OpenCode worker by itself (see [OpenCode jobs](#opencode-jobs)); after a plain `ask_warriorgpt` call or the CLI, use `start_opencode_job` or `warriorgpt-delegate` rather than retrying the same call.
 
 ### Background jobs
 
@@ -157,10 +157,11 @@ An MCP tool call blocks until it returns, and a checked task can run for several
 
 | Tool | What it does |
 |---|---|
-| `start_warriorgpt_job` | Takes the same arguments as `ask_warriorgpt`, starts the run in the server process and returns a `job_id` at once. Bad arguments (for example `check` without `files`) fail here, not later. |
+| `start_warriorgpt_job` | Takes the same arguments as `ask_warriorgpt`, starts the run in the server process and returns a `job_id` at once. Bad arguments (for example `check` without `files`) fail here, not later. It also takes `opencode_fallback` (default true): when the check never passes, the same job hands the task to an OpenCode worker (see [OpenCode jobs](#opencode-jobs)). |
+| `start_opencode_job` | Starts an OpenCode coding agent on WarriorGPT in a git worktree and returns a `job_id` at once. See [OpenCode jobs](#opencode-jobs). |
 | `get_warriorgpt_job_status` | `job_id` gives the state (`queued`, `running`, `cancelling`, `done`, `failed`, `cancelled`), the time elapsed, progress (one-shot replies, the latest tool-loop step, request retries, and `next_retry: {attempt, of, reason, at}` while a retry is waiting), the job it waits for (`waiting_for`) when it is queued behind one, the last `log_lines` log lines (default 15, max 100) and `next_poll_s`. With no `job_id` it lists every job. |
-| `get_warriorgpt_job_result` | The result of a finished job, in the same shape `ask_warriorgpt` returns: the text, `isError`, and `structuredContent` with `ok`, `fallback` and `attempts` when the check never passed. A job that has not finished answers with its state instead. |
-| `cancel_warriorgpt_job` | Stops the job's requests and checks and puts every file it may change back as it was. A queued job is dropped at once; a running one usually stops within a second or two, and the call waits up to 5 s for that. |
+| `get_warriorgpt_job_result` | The result of a finished job, in the same shape `ask_warriorgpt` returns: the text, `isError`, and `structuredContent` with `ok`, `fallback` and `attempts` when the check never passed. An OpenCode job answers with `structuredContent` `{ok, kind: "opencode", exit, status, name, branch, worktree, base_sha, commits, run_dir, needs_input}`. A job that has not finished answers with its state instead. |
+| `cancel_warriorgpt_job` | Stops the job's requests and checks and puts every file it may change back as it was. For an OpenCode job it stops the worker; its worktree and any commits stay where they are, unmerged. A queued job is dropped at once; a running one usually stops within a second or two, and the call waits up to 5 s for that. |
 
 The status and result tools take `wait_s` (at most 30): the call waits that long for the job to finish, and answers as soon as it does. The tool descriptions ask the model to poll about every 30 s (15 s in the first minute, 60 s after five minutes) and to do other work in between.
 
@@ -174,7 +175,25 @@ The `warriorgpt-ask` CLI with the Bash tool's `run_in_background` still works. C
 warriorgpt-ask --prompt-file /tmp/brief.md --files src/a.js,test/a.test.js --check "npm test" --cwd "$PWD"
 ```
 
-A rule for your `CLAUDE.md`: "For WarriorGPT tasks with a check, use `start_warriorgpt_job` and poll it (or run `warriorgpt-ask` with Bash `run_in_background`); use the `ask_warriorgpt` tool only for quick, unchecked calls."
+A rule for your `CLAUDE.md`: "For a WarriorGPT code change, use `start_opencode_job` and poll it. For a small change with a check where you can name every file, `start_warriorgpt_job` is faster and lighter, and it hands the task to OpenCode by itself if the check never passes. Use the `ask_warriorgpt` tool only for quick, unchecked calls and narrow questions about named files."
+
+### OpenCode jobs
+
+`start_opencode_job` runs `warriorgpt-delegate` (see [Compared with OpenCode](#compared-with-opencode)) in the server process: an OpenCode agent on a WarriorGPT model that reads the repo, edits files, runs commands and commits its work. It needs OpenCode installed (steps 1 and 2 of [docs/opencode-subagent.md](docs/opencode-subagent.md)); no OpenCode provider setup is needed, and none of yours is used. The worker is sealed: its OpenCode config names only the WarriorGPT provider and leaves out your own config, plugins and logins, so it cannot spend an OpenCode Go or other subscription.
+
+| Argument | Meaning |
+|---|---|
+| `dir` | Absolute path of the project (required). Write mode needs a git repository. |
+| `brief` | The task. It must stand alone: the worker sees only this, the files under `dir` and any `instructions` files. |
+| `mode` | `write` (default): edit and commit on branch `dl/<name>` in a worktree under the state directory. `read`: only read and report. |
+| `name` | Task name (lower-case letters, digits, dashes); made up when left out. A reply needs it. |
+| `reply` | With `name` and `dir`, answers the worker's questions and continues the same session. |
+| `model`, `timeout_min`, `instructions` | WarriorGPT model id (default `local.qwen3.8-27b`); minutes before the worker is stopped (default 30, max 240); absolute paths of extra instruction files. |
+| `include_uncommitted` | Default true: the worktree starts from a snapshot commit of your uncommitted and untracked (not ignored) work, built in a temporary index, so your own index, HEAD and files are never touched. The result then says to bring over only the worker's commits with `git cherry-pick <snapshot>..dl/<name>`. |
+
+Poll it with the same job tools, about every 60 s; a task usually takes 1 to 10 minutes. `exit` in the result is the delegate's exit code: 0 done (review the diff it names, then merge yourself; the worker never merges or pushes), 4 the worker asked questions (`needs_input: true`, not an error: answer with `reply`), 9 no change made, 8 timed out, 3 WarriorGPT unreachable, 1 or 10 failed or partial. At most two OpenCode jobs run at once (`WARRIORGPT_MAX_OPENCODE_JOBS`), since each holds a worktree.
+
+When a `start_warriorgpt_job` with a check never passes, every file is restored and, unless `opencode_fallback` is false, the same job starts an OpenCode worker on branch `dl/fb-<id>` in the repository that holds the files, with a brief made from the prompt, the files, the check and the last failure. The job stays running until the worker finishes. Its result carries `fallback: "opencode"`, the ask's `attempts`, and the worker's result under `opencode`; the text has both. A folder outside git skips the fallback and says so.
 
 ### Retries and the request limit
 
@@ -206,6 +225,7 @@ Models:
 | `WARRIORGPT_MODEL` | Default model when a call does not pass `model`. |
 | `WARRIORGPT_MAX_CONCURRENCY` | WarriorGPT requests in flight at once, shared by every job and every `warriorgpt-mcp` and `warriorgpt-ask` on the machine. Default 6; 0 turns the limit off. The `--max-concurrency` flag overrides it. |
 | `WARRIORGPT_MAX_JOBS` | Jobs the MCP server runs at once; the rest queue. Default 3. |
+| `WARRIORGPT_MAX_OPENCODE_JOBS` | OpenCode jobs the MCP server runs at once; the rest queue. Default 2. |
 | `WARRIORGPT_MAX_RETRIES` | Times a request is sent again after a 429, a dropped connection or a cut stream. Default 5; 0 turns retries off. |
 | `WARRIORGPT_RETRY_BASE_MS` | First retry backoff in ms, doubled on each retry up to 30 s. Default 1000. |
 | `WARRIORGPT_HEADER_TIMEOUT_MS` | How long to wait for response headers before the try counts as timed out and is retried. Default 90000. |
@@ -221,7 +241,21 @@ The state directory is `~/.local/share/warriorgpt-mcp` on macOS and Linux, and `
 
 ## Compared with OpenCode
 
-You can also hand WarriorGPT work through an [OpenCode](https://opencode.ai/) subagent, which can search the repo and run code to check itself, but uses some Claude usage per task for the Haiku subagent that briefs and checks it, and is slower. Use `ask_warriorgpt` when you can name the files involved. The npm install includes `warriorgpt-delegate`, a runner for that route: it checks the model answers, runs OpenCode in a git worktree with a minimal config, lets the worker stop and ask questions, and writes a report for the subagent to verify. [docs/opencode-subagent.md](docs/opencode-subagent.md) covers setup, trade-offs, and a benchmark of the two.
+The npm install includes `warriorgpt-delegate`, the runner behind `start_opencode_job`: it checks the model answers, runs OpenCode in a git worktree with a sealed config that can reach only WarriorGPT, lets the worker stop and ask questions, and writes `summary.json` and `report.md` in its run folder. `start_opencode_job` starts it from the MCP server, so no Claude subagent is needed to brief and check it. You can also run it from a shell, or from an OpenCode subagent; [docs/opencode-subagent.md](docs/opencode-subagent.md) covers setup and the subagent route.
+
+A bench on 2026-11-24 gave the same six Node tasks (from a small duration parser to a semver range matcher and an expression calculator) to both routes, three rounds each, with `local.qwen3.8-27b`, and checked each result against hidden tests the model never saw. The check-loop route ran the `warriorgpt-ask` CLI with the loop lane, in a worktree; the OpenCode route ran `warriorgpt-delegate`.
+
+| Task | Check loop: all hidden tests pass | OpenCode: all hidden tests pass | Check loop: median time | OpenCode: median time | Check loop: WarriorGPT tokens | OpenCode: WarriorGPT tokens |
+|---|---|---|---|---|---|---|
+| a-duration | 3/3 | 3/3 | 79 s | 110 s | 106k | 188k |
+| b-cart | 3/3 | 3/3 | 70 s | 61 s | 63k | 102k |
+| c-csv | 3/3 | 3/3 | 41 s | 60 s | 61k | 108k |
+| d-report | 3/3 | 3/3 | 38 s | 31 s | 57k | 66k |
+| e-semver | 1/3 | 3/3 | 528 s | 442 s | 738k | 1,085k |
+| f-calc | 2/3 | 3/3 | 481 s | 397 s | 666k | 2,167k |
+| Total | 15/18 | 18/18 | 62 min (sum) | 54 min (sum) | 5.1M | 11.1M |
+
+Tokens are the mean per run. On the four small tasks the two are close and the check loop uses about 60% of the tokens. On the two harder ones OpenCode passed every round. Two of the check loop's misses were exit 4 (the check never passed), which the automatic fallback now hands to OpenCode. The third passed its visible check but failed one hidden test, which no fallback can catch: review the diff. The loop lane did the work in 13 of the 18 check-loop runs. Caveats: three rounds per cell, the check loop's step limit went from 30 to 40 partway through, and the last four runs ran in parallel. So `start_opencode_job` is the route for real code changes, and the check loop stays for small checked tasks where you can name the files.
 
 ## Getting good results
 

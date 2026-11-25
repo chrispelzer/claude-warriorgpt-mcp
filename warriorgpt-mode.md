@@ -1,8 +1,8 @@
 # WarriorGPT mode
 
 This session was started with `claude-warriorgpt`. WarriorGPT delegation is
-enabled: the `ask_warriorgpt` tool hands coding work to Wayne State's
-WarriorGPT models, so it does not count against Claude usage.
+enabled: the `ask_warriorgpt` and `start_opencode_job` tools hand coding work
+to Wayne State's WarriorGPT models, so it does not count against Claude usage.
 
 Claude is the strongest model here. You stay in charge: you plan, decide, and
 verify. WarriorGPT only does work where being a weaker model does not matter.
@@ -74,8 +74,12 @@ through Bash with `run_in_background` also works (see the README, "Background
 jobs"). A passing result, or CLI exit 0, means the check passed; with
 `verify`, that holds even when the self-check ran out of steps (its edits are
 undone if they broke the check). `fallback: opencode` in the result, or exit 4,
-means the check never passed and every file is back as it was: do not retry the same call, hand the task to `warrior-coder`
-(below), which can run the tests and read around the code.
+means the check never passed and every file is back as it was. A
+`start_warriorgpt_job` then hands the task to an OpenCode worker by itself
+and the result carries the worker's branch under `opencode`: review that diff.
+After a plain call or the CLI, do not retry the same call: start the task
+with `start_opencode_job` (below), which can run the tests and read around
+the code.
 
 What makes checked jobs pass: write the acceptance tests first and pass
 them as `check`; split a big module into small tasks, each naming its
@@ -91,24 +95,34 @@ Pick `model` per task: `local.qwen3.8-27b` (the default) for writing code,
 `local.gpt-oss-120b` when the task needs more reasoning, `local.gemma-4-31b`
 if those are down.
 
-It cannot see the repo or run anything. If the `warrior-coder` subagent is set
-up (see docs/opencode-subagent.md), use it instead only when the task needs
-what `ask_warriorgpt` lacks. It uses more Claude usage per task (a Haiku
-subagent writes the brief and checks the result) and is slower. Use it when
-the task:
+`ask_warriorgpt` cannot see the repo or run anything. `start_opencode_job`
+can: it starts an OpenCode agent on WarriorGPT in a git worktree on branch
+`dl/<name>`, with the user's uncommitted work included, and returns a job_id
+at once. It costs no more Claude usage than a job (your brief and your
+review), takes longer, and passed every round of the harder tasks in the
+README's bench where the check loop missed. Use it for a real code change:
+when the task
 - needs the model to run the code or tests and fix its own mistakes,
-- needs it to read nearby files you cannot name up front, or
+- needs it to read nearby files you cannot name up front,
 - has edits that are hard to state as exact search/replace text, such as a
-  sweep across many places in a large file.
+  sweep across many places in a large file, or
+- spans several files with a spec to meet.
 
-Size `warrior-coder` tasks to the model: `local.qwen3.8-27b` takes bounded
-tasks (some reading and choosing inside named files); `local.gpt-oss-120b`
-only atomic ones (one file, one change, exact text given). Split anything
-bigger. It can also answer a read-only question about one folder in read mode.
-If the worker asks questions, answer them (or ask the user) and have the
-subagent resume the same run rather than starting over.
+Write the brief so it stands alone: the goal, the spec (exact values,
+messages, edge cases), the files in scope, what not to change, and the check
+to run before it commits. Poll `get_warriorgpt_job_status` about every 60 s.
+When it is done, read `get_warriorgpt_job_result`, review the diff it names,
+and merge it yourself (with `git cherry-pick` as the result says, when it
+started from a snapshot of uncommitted work). Size tasks to the model:
+`local.qwen3.8-27b` (the default) takes bounded tasks, some reading and
+choosing inside named files; split anything bigger. With `mode: read` it
+answers a read-only question about a folder. If the result has
+`needs_input: true`, the worker asked questions: answer them (or ask the
+user) with `start_opencode_job` and the same `name` and `dir` plus `reply`,
+rather than starting over.
 
-Without `warrior-coder`, do those tasks with Claude.
+`start_opencode_job` needs OpenCode installed (docs/opencode-subagent.md,
+steps 1 and 2). If it is not installed, do those tasks with Claude.
 
 ## Keep with Claude
 
