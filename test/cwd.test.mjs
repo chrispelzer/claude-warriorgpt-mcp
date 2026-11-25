@@ -1,7 +1,7 @@
 // The check's default folder (the project root) and checks that cannot run at all.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, symlinkSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, delimiter } from 'node:path';
 import { defaultCwd, checkProgram, programFound, cannotRun } from '../ask.mjs';
@@ -69,6 +69,30 @@ test('programFound: a path from cwd, a bare name on PATH', () => {
         assert.equal(programFound('node', proj, { PATH: '' }), true, 'node is this Node binary');
     } finally {
         rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('programFound: a Windows app execution alias (lstat only) counts as present', (t) => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'warriorgpt-alias-test-')));
+    try {
+        try {
+            // A dangling symlink stands in for an app execution alias: existsSync follows it and fails, lstat sees it.
+            symlinkSync(join(dir, 'missing-target'), join(dir, 'fakepwsh.exe'));
+            assert.equal(programFound('fakepwsh', dir, { PATH: dir, PATHEXT: '.EXE' }, 'win32'), true,
+                'a dangling .exe symlink is present');
+        } catch (err) {
+            if (err.code !== 'EPERM' && err.code !== 'ENOTSUP') throw err;
+            t.diagnostic(`skipping the dangling-symlink part (symlinkSync failed: ${err.code})`);
+        }
+        if (process.platform === 'win32') {
+            let hasAlias = false;
+            try { lstatSync(join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps', 'pwsh.exe')); hasAlias = true; } catch { /* no Store pwsh */ }
+            if (hasAlias) assert.equal(programFound('pwsh', process.cwd(),
+                { PATH: join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps'), PATHEXT: '.EXE' }, 'win32'), true,
+                'the real pwsh alias from %LOCALAPPDATA%\\Microsoft\\WindowsApps');
+        }
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
     }
 });
 
