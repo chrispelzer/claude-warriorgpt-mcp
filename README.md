@@ -9,6 +9,7 @@ It is plain Node with no dependencies and works on macOS, Linux, and Windows.
 - Claude Code
 - Node 22 or newer
 - A WarriorGPT API key from https://warriorgpt.wayne.edu/developer/api-key
+- For `start_opencode_job` and the automatic OpenCode fallback only: [OpenCode](https://opencode.ai/) (steps 1 and 2 of [docs/opencode-subagent.md](docs/opencode-subagent.md)). Nothing else in OpenCode needs setting up, and none of your OpenCode providers or subscriptions is used.
 
 ## Install
 
@@ -38,11 +39,13 @@ To install by hand:
 
    On any system you can instead export `WARRIORGPT_API_KEY` from your shell profile, as long as Claude Code is started from that shell.
 
-2. Install the server globally:
+2. Install the server globally, at the latest release (see [Releases](https://github.com/chrispelzer/claude-warriorgpt-mcp/releases)):
 
    ```
-   npm install -g github:chrispelzer/claude-warriorgpt-mcp
+   npm install -g github:chrispelzer/claude-warriorgpt-mcp#v1.1.0
    ```
+
+   Leave out `#v1.1.0` to install the newest commit on `main` instead.
 
 3. Register it with Claude Code for all projects.
 
@@ -60,7 +63,7 @@ To install by hand:
 
 4. Start a new Claude Code session and check `/mcp` shows `warriorgpt` as connected.
 
-To update, rerun the `npm install -g` command; append `#<commit or tag>` to pin a version. If you manage Node with a version manager (asdf, nvm, fnm), the command is installed for the current Node version only, so reinstall after switching versions.
+To update, rerun the `npm install -g` command with the new release's tag (or with `#<commit>`, or with no suffix for the newest `main`). [CHANGELOG.md](CHANGELOG.md) lists what changed in each release, and the `initialize` reply reports the installed version. If you manage Node with a version manager (asdf, nvm, fnm), the command is installed for the current Node version only, so reinstall after switching versions.
 
 ## The tool
 

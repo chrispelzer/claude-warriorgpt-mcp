@@ -73,6 +73,23 @@ Branch off `main`, open a pull request against `main`, and make sure `npm test` 
 
 Keep code comments short, and add them only when the why is not obvious.
 
+Add a line under "Unreleased" in `CHANGELOG.md` for anything a user would notice.
+
+## Releasing
+
+Releases are git tags; there is no npm publish. In one pull request:
+
+1. Bump `version` in `package.json` (semver: a new tool or flag is a minor bump, fixes only a patch). The server reports this version in `initialize`.
+2. In `CHANGELOG.md`, turn "Unreleased" into `## X.Y.Z (date)` and start a new, empty "Unreleased" above it.
+3. Change the `#vX.Y.Z` pin in the README's install step.
+
+After it merges, tag the merge commit and make the release from that changelog section:
+
+```
+git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z
+gh release create vX.Y.Z --title vX.Y.Z --notes-file <the section as a file>
+```
+
 ## Reporting issues
 
 Include:

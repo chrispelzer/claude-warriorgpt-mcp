@@ -3,6 +3,7 @@
 // session can hand text generation to WarriorGPT without going through opencode.
 
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
@@ -11,6 +12,9 @@ import { MODELS, runAsk, UsageError, defaultCwd } from './ask.mjs';
 import { createJobs, track } from './jobs.mjs';
 import { runOpenCode, taskName, fallbackBrief } from './opencode-jobs.mjs';
 import { setMaxConcurrency } from './limit.mjs';
+
+// The version clients see in initialize, kept in one place: package.json.
+const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
 const TOOL = {
     name: 'ask_warriorgpt',
@@ -370,7 +374,7 @@ async function handle(req) {
             return send({ id, result: {
                 protocolVersion: params?.protocolVersion || '2025-06-18',
                 capabilities: { tools: {} },
-                serverInfo: { name: 'warriorgpt', version: '1.0.0' },
+                serverInfo: { name: 'warriorgpt', version: VERSION },
             } });
         case 'ping':
             return send({ id, result: {} });
