@@ -197,10 +197,13 @@ test('server: the job tools are listed, and ask_warriorgpt points checked work a
         child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) + '\n');
     });
     assert.deepEqual(list.map((t) => t.name), ['ask_warriorgpt', 'start_warriorgpt_job', 'get_warriorgpt_job_status',
-        'get_warriorgpt_job_result', 'cancel_warriorgpt_job']);
+        'get_warriorgpt_job_result', 'cancel_warriorgpt_job', 'start_opencode_job']);
     assert.match(list[0].description, /start_warriorgpt_job/);
     assert.match(list[2].description, /30 s/);
-    assert.deepEqual(list[1].inputSchema, list[0].inputSchema);
+    // start_warriorgpt_job takes ask_warriorgpt's arguments plus opencode_fallback.
+    const { opencode_fallback, ...jobProps } = list[1].inputSchema.properties;
+    assert.ok(opencode_fallback);
+    assert.deepEqual({ ...list[1].inputSchema, properties: jobProps }, list[0].inputSchema);
 });
 
 test('server: start returns a job id at once; status shows progress; result has ask_warriorgpt\'s shape', async () => {
@@ -326,6 +329,6 @@ test('server: ask_warriorgpt with a progressToken sends notifications/progress a
 test('server: an unknown tool lists the real ones', async () => {
     const s = server();
     const res = await s.tool('ask_warriorgpt_job', {});
-    assert.match(res.rpcError.message, /Unknown tool ask_warriorgpt_job; the tools are ask_warriorgpt, start_warriorgpt_job, get_warriorgpt_job_status, get_warriorgpt_job_result, cancel_warriorgpt_job/);
+    assert.match(res.rpcError.message, /Unknown tool ask_warriorgpt_job; the tools are ask_warriorgpt, start_warriorgpt_job, get_warriorgpt_job_status, get_warriorgpt_job_result, cancel_warriorgpt_job, start_opencode_job/);
     await s.close();
 });

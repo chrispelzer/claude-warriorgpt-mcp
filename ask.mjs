@@ -1,9 +1,9 @@
 // The ask_warriorgpt core, shared by the MCP server and the warriorgpt-ask CLI.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync } from 'node:fs';
-import { dirname, resolve, join, sep, delimiter, isAbsolute } from 'node:path';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, rmSync, existsSync, realpathSync, statSync, lstatSync } from 'node:fs';
+import { dirname, resolve, join, relative, sep, delimiter, isAbsolute } from 'node:path';
 import { unfence, writeFiles, planFiles, writePlan } from './edits.mjs';
-import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow } from './loop.mjs';
+import { runLoop, FIX_SYSTEM, VERIFY_SYSTEM, VERIFY_THINK_BUDGET, VERIFY_MS, headTail, isContextOverflow, timeoutNote } from './loop.mjs';
 import { makeCopy, inside, CantCopyError, copyEnv, probeCopy, sameFailure } from './workspace.mjs';
 import { availableParallelism, homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -69,8 +69,8 @@ export const samplingFor = (model, temperature) => {
 const RETRY_TEMPERATURE_BASE = 0.6;
 // Replies that spent the whole budget thinking are retried without using up an attempt, at most this often.
 const MAX_FREE_RETRIES = 2;
-export const FALLBACK_HINT = 'fallback: opencode. Hand this task to an agent that can run the tests and read the code ' +
-    '(for example warriorgpt-delegate, or your OpenCode subagent).';
+export const FALLBACK_HINT = 'fallback: opencode. Hand this task to an OpenCode worker on WarriorGPT: start_opencode_job ' +
+    'in this MCP server (start_warriorgpt_job does it for you), or warriorgpt-delegate on the command line.';
 export const MAX_TEMPERATURE = 0.8;
 // The loop lane is the main path on hard tasks; OpenCode has no step cap, and lower caps made lanes give up too early.
 const DEFAULT_STEPS = 30;
@@ -598,7 +598,13 @@ export function checkProgram(command) {
 export function programFound(program, cwd, env = process.env, platform = process.platform) {
     if (/^node(\.exe)?$/i.test(program) || program === process.execPath) return true;
     const exts = platform === 'win32' ? ['', ...(env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';')] : [''];
-    const tryAt = (base) => exts.some((e) => existsSync(base + e));
+    // A Windows app execution alias is a reparse point to a missing target: existsSync (which follows links)
+    // reports it absent while lstat sees it, so either one counts as present.
+    const present = (p) => {
+        if (existsSync(p)) return true;
+        try { lstatSync(p); return true; } catch { return false; }
+    };
+    const tryAt = (base) => exts.some((e) => present(base + e));
     if (/[/\\]/.test(program)) return tryAt(isAbsolute(program) ? program : resolve(cwd, program));
     return (env.PATH || env.Path || '').split(delimiter).filter(Boolean).some((d) => tryAt(join(d, program)));
 }
@@ -688,6 +694,9 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     const loopLane = loop && args.loop_lane !== false && args.loop_lane !== 'false';
     const maxSteps = Math.min(Math.max(Number(args.max_steps) || DEFAULT_STEPS, 1), MAX_STEPS);
     const checkTimeout = Math.min(Math.max(Number(args.check_timeout_s) || 300, 1), 3600);
+    // When the check never passes, save the closest state's versions of the files here instead of losing them.
+    const keepFailed = args.keep_failed ? resolve(args.keep_failed) : null;
+    if (keepFailed && !check) throw new UsageError('keep_failed needs check: there is nothing that can fail without it.');
     const { dir: cwd, why: cwdWhy } = args.cwd ? { dir: resolve(args.cwd), why: 'as given' }
         : files.length ? defaultCwd(files) : { dir: process.cwd(), why: 'the current folder' };
     if (check && !existsSync(cwd)) throw new UsageError(`cwd does not exist: ${cwd}`);
@@ -785,6 +794,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         return ran;
     };
     const warnings = [];
+    const blockedPaths = new Set(); // files the loop was refused edits to: not in the allowed list
     const warn = (text) => {
         warnings.push(text);
         log(`!!! WARNING: ${text}`);
@@ -842,6 +852,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         chat: mode === 'verify' ? verifyChat : loopChat, files, readable: [...files, ...contextPaths], cwd, mode,
         runCheck: () => runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd)).then(noteCheck).then(throwIfBroken), runNode: (code) => runNode(code, cwd, stop, contextPaths), log,
         maxSteps: steps, maxTokens: mode === 'verify' ? LANE_MAX_TOKENS : loopMaxTokens, onRunaway: () => { runawaySeen = true; }, system: mode === 'verify' ? VERIFY_SYSTEM : FIX_SYSTEM,
+        checkTimeoutS: checkTimeout,
         ...(history ? { history } : {}), verifyThink: VERIFY_THINK_BUDGET, verifyMs: verifyMs,
         user: history
             ? `Your edits were applied and the check passes. From here you work through tools (no more file blocks).\n\n` +
@@ -1023,15 +1034,17 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                     runCheck: () => checks(() => probed.then(() => runCheck(laneCheck, copy.dir, checkTimeout, signal, copyEnv(copy.dir))))
                         .then(noteCheck),
                     runNode: (code) => runNode(code, copy.dir, signal, [cwd, ...contextPaths]), onRunaway: () => { runawaySeen = true; }, system: FIX_SYSTEM,
+                    checkTimeoutS: checkTimeout,
                     user: `${args.prompt}${contextText}\n\nFiles you may change, as they are now:${now}\n\nWorking directory: ${copy.dir}\n` +
                         `Check command: ${laneCheck}\n\nMake the change with the tools: read what you need, edit, run the check, ` +
                         'and call done when it passes.',
                 });
                 if (signal.aborted) return { cancelled: true };
-                const contents = res.passed ? new Map(files.map((f) => {
+                // The lane's final versions of the allowed files, kept even when it fails: keep_failed may save them.
+                const contents = new Map(files.map((f) => {
                     const c = copy.to(f);
                     return [f, existsSync(c) ? readFileSync(c) : null];
-                })) : null;
+                }));
                 say(`--- loop lane ${res.passed ? `passed at step ${res.steps}` : `out of steps after ${res.steps}`} (in a copy of the tree)`);
                 return { res, contents };
             } catch (err) {
@@ -1050,7 +1063,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
         stop?.addEventListener('abort', onStop, { once: true });
         brokenStop.signal.addEventListener('abort', onStop, { once: true });
         const lanePromise = loopLane ? runLane().then((r) => {
-            if (r.contents && winner === null) {
+            if (r.res?.passed && winner === null) {
                 winner = 'loop';
                 ctls.forEach((c) => c.abort());
             } else if (r.cancelled) log('--- [loop] cancelled: a one-shot attempt passed');
@@ -1081,12 +1094,19 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     const budgetAt = (n) => Math.min(thinkBudget * 2 ** n, Math.max(thinkBudget, MAX_THINK_BUDGET));
     let steps = 0;
     let passed = null;
+    let raced = null;
+    let best = null; // the closest one-shot attempt when none wins; keep_failed may save its plan
+    // The real tree's state when work was done in place (sequential attempts, or the tool loop after the one-shot
+    // plans were written there): keep_failed may save it as the closest state.
+    let treeTouched = false;
+    let treeLabel = '';
+    let treeOutput = '';
     let attemptsMade = maxAttempts;
     let laneSelfCheck = null; // the lane's own self-check, when it won with verify on
     let shotHistory = null; // the winning one-shot attempt's conversation, ending with its reply (verify continues it)
     try {
         stopped();
-        const raced = loop && files.every((f) => inside(cwd, f)) ? await raceAttempts() : null;
+        raced = loop && files.every((f) => inside(cwd, f)) ? await raceAttempts() : null;
         stopped();
         if (loop && !raced) log('=== one first attempt');
         const laneDone = !!(raced?.lane && !raced.lane.cancelled);
@@ -1119,7 +1139,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             // No winner: the closest attempt seeds the loop, the one that thought longest breaking ties; the loop's first
             // step then gets a thinking budget near what the longest thinker used.
             const live = raced.results.filter((r) => !r.cancelled);
-            const best = won || [...live].sort((a, b) => a.score - b.score || (b.thought || 0) - (a.thought || 0) || a.i - b.i)[0];
+            best = won || [...live].sort((a, b) => a.score - b.score || (b.thought || 0) - (a.thought || 0) || a.i - b.i)[0];
             if (!won) {
                 // What an attempt that finished its thinking (and wrote edits) used; if none did, the most any spent.
                 const finished = live.filter((r) => r.plan);
@@ -1227,6 +1247,10 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             const ran = throwIfBroken(noteCheck(await runCheck(check, cwd, checkTimeout, stop, copyEnv(cwd))));
             stopped();
             log(`--- attempt ${attempt}: check ${ran.ok ? 'passed' : ran.timedOut ? 'timed out' : `failed (exit ${ran.code})`}\n${tail(ran.output, 20000)}`);
+            // The attempt's edits are in the real tree and were checked there: the tree is a candidate for keep_failed.
+            treeTouched = true;
+            treeLabel = `working tree after attempt ${attempt}`;
+            treeOutput = ran.output;
             if (ran.ok) {
                 passed = { attempts: attempt, loop: false, head: `check passed on attempt ${attempt} of ${maxAttempts}: ${check}\n` +
                     summary.replace(/\n\([^\n]*\)$/, '') };
@@ -1234,13 +1258,16 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             }
             const why = ran.timedOut ? `timed out after ${checkTimeout}s` : `failed (exit ${ran.code})`;
             const output = headTail(ran.output);
+            // A timed-out run's output is cut before the runner's summary; the note says so, and what a hang usually is.
+            const note = ran.timedOut ? `${timeoutNote(checkTimeout)}\n` : '';
             lastFailure = `check ${why}:\n${output}`;
-            retry(reply.text, `Your edits were written and \`${check}\` ${why}. Output:\n\`\`\`\n${output}\n\`\`\``);
+            retry(reply.text, `Your edits were written and \`${check}\` ${why}. Output:\n${note}\`\`\`\n${output}\n\`\`\``);
         }
 
         if (!passed && laneDone && !raced.laneWon) {
             // The loop lane already ran its steps alongside the attempts: no second loop.
             const lane = raced.lane;
+            (lane.res?.blocked || []).forEach((b) => blockedPaths.add(b));
             if (lane.res?.lastOutput) lastFailure = `check ${headTail(lane.res.lastOutput)}`;
             else if (lane.error) lastFailure = `${lastFailure ? `${lastFailure}\n` : ''}the loop lane stopped: ${lane.error.message}`;
             if (lane.res && lane.res.steps >= maxSteps) outOfSteps = true;
@@ -1253,6 +1280,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                 'Find the cause and fix it with the tools until the check passes, then call done.', maxSteps);
             steps += res.steps;
             stopped();
+            (res.blocked || []).forEach((b) => blockedPaths.add(b));
             if (res.passed) {
                 passed = { attempts: attemptsMade, loop: true, head: `check passed in the tool loop at step ${res.steps} of ${maxSteps} ` +
                     `(${attemptsMade > 1 ? `${attemptsMade} parallel attempts` : 'attempt 1'} missed): ${check}${res.summary ? `\n${res.summary}` : ''}` };
@@ -1260,6 +1288,13 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
                 // The loop's own last check run, if it ran one; otherwise the one-shot failure still stands.
                 if (res.lastOutput) lastFailure = `check ${headTail(res.lastOutput)}`;
                 if (res.steps >= maxSteps) outOfSteps = true;
+                // The loop worked on the real tree from the best one-shot plan: when it changed anything, its final
+                // state is newer than the plan and a candidate for keep_failed.
+                if (res.edits > 0) {
+                    treeTouched = true;
+                    treeLabel = `working tree after tool-loop step ${res.steps}`;
+                    if (res.lastOutput) treeOutput = res.lastOutput;
+                }
             }
         }
     } catch (err) {
@@ -1270,13 +1305,67 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
     }
 
     if (!passed) {
+        let kept = null;
+        let keptLabel = null;
+        if (keepFailed) {
+            // The closest state, by fewest failing tests: the working tree when work was done in place, the loop
+            // lane's final tree when it ran, or the best one-shot plan. A scored state always beats an unscored one;
+            // with no scored state, the first candidate in that order stands.
+            const scoreOf = (output) => (output ? (output.startsWith('PASSED') ? 0 : failCount(output)) : null);
+            const candidates = [];
+            if (treeTouched) candidates.push({ label: treeLabel, output: treeOutput, save: () => {
+                for (const f of files) {
+                    if (!existsSync(f)) continue;
+                    const out = join(keepFailed, relative(cwd, f));
+                    mkdirSync(dirname(out), { recursive: true });
+                    writeFileSync(out, readFileSync(f));
+                }
+            } });
+            const laneRes = raced?.lane?.res || null;
+            if (laneRes) candidates.push({ label: `loop lane, step ${laneRes.steps}`, output: laneRes.lastOutput, save: () => {
+                for (const [f, buf] of raced.lane.contents) {
+                    if (buf === null) continue; // deleted or never created in that state
+                    const out = join(keepFailed, relative(cwd, f));
+                    mkdirSync(dirname(out), { recursive: true });
+                    writeFileSync(out, buf);
+                }
+            } });
+            if (best?.plan) candidates.push({ label: `attempt a${best.i + 1}`, output: best.ran?.output,
+                save: () => writePlan(best.plan, (p) => join(keepFailed, relative(cwd, p))) });
+            for (const c of candidates) c.score = scoreOf(c.output);
+            const scored = candidates.filter((c) => c.score !== null && c.score < 1e6);
+            const state = scored.length ? scored.reduce((a, b) => (b.score < a.score ? b : a)) : candidates[0] || null;
+            if (state) {
+                mkdirSync(keepFailed, { recursive: true });
+                state.save();
+                const md = [`# Closest attempt`, '', `Source: ${state.label}`];
+                if (state.score !== null && state.score < 1e6) md.push(`Failing tests: ${state.score}`);
+                md.push(`Check: \`${check}\``, '');
+                if (state.output !== undefined) md.push('Last check output:', '', '```', headTail(state.output) || '(no output)', '```');
+                else md.push('No check output: no check ran in that state.');
+                writeFileSync(join(keepFailed, 'CLOSEST.md'), `${md.join('\n')}\n`);
+                kept = keepFailed;
+                keptLabel = state.label;
+                log(`--- kept the closest attempt (${state.label}) in ${kept}`);
+            }
+        }
         restore();
         const tried = `${attemptsMade} attempt${attemptsMade === 1 ? '' : 's'}${steps ? ` and ${steps} tool-loop steps` : ''}`;
         // Failures that are not the model's code: the check setup, the thinking budget, the step and time caps.
         const same = sameFailure(checkRuns, [cwd]);
         if (same) {
-            warn(`all ${same} check runs failed with the same output, whatever the edits: the check setup may be wrong ` +
-                '(for example, it is not testing the edited copy). Fix the check before handing the task on.');
+            // Runs that all timed out the same way are a hang, not a broken check: say so instead of blaming the setup.
+            if (checkRuns.every((r) => r.timedOut)) {
+                warn(`all ${same} check runs timed out after ${checkTimeout} s: the check may hang (an open handle or a test that never ends); ` +
+                    'a runner flag that forces exit, or a per-test timeout, makes it report failures');
+            } else {
+                warn(`all ${same} check runs failed with the same output, whatever the edits: the check setup may be wrong ` +
+                    '(for example, it is not testing the edited copy). Fix the check before handing the task on.');
+            }
+        }
+        if (blockedPaths.size) {
+            warn(`the model tried to change files outside the allowed list: ${[...blockedPaths].join(', ')}. The task needs them: ` +
+                'add them to the files list (a path that does not exist yet is created) and run again; a run with the same list will fail the same way.');
         }
         if (outOfThinking.length) {
             warn(`${outOfThinking.join(', ')} ran out of thinking budget before writing any file, with the budget doubled ` +
@@ -1300,6 +1389,7 @@ export async function runAsk(args, { signal: stop, onLog } = {}) {
             ...(steps ? { steps } : {}),
             usage: { ...total },
             files: [],
+            ...(kept ? { kept, kept_source: keptLabel } : {}),
         };
     }
 

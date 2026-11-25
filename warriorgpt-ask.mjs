@@ -27,6 +27,8 @@ const HELP = `Usage: warriorgpt-ask (--prompt-file <file> | --prompt <text>) [op
   --max-attempts <n>     with --no-loop: attempts before giving up (default 3, max 5)
   --check-timeout <s>    with --check: seconds before a run is killed (default 300, max 3600); slow suites
                          (PHP, a full pytest run) may need more
+  --keep-failed <dir>    with --check: when it never passes, save the closest state's versions of the --files
+                         paths (plus a CLOSEST.md) under <dir> instead of losing them to the restore
   --output-file <path>   write the reply to this one file instead (not with --files)
   --model <id>           WarriorGPT model (default local.qwen3.8-27b or WARRIORGPT_MODEL)
   --system-file <file>   a system prompt
@@ -81,6 +83,7 @@ async function main() {
                 'no-loop': { type: 'boolean' },
                 'no-loop-lane': { type: 'boolean' },
                 'check-timeout': { type: 'string' },
+                'keep-failed': { type: 'string' },
                 'output-file': { type: 'string' },
                 model: { type: 'string' },
                 'system-file': { type: 'string' },
@@ -135,6 +138,7 @@ async function main() {
         loop: !opts['no-loop'],
         loop_lane: !opts['no-loop-lane'],
         check_timeout_s: opts['check-timeout'],
+        keep_failed: opts['keep-failed'],
         output_file: opts['output-file'],
         model: opts.model,
         system: opts['system-file'] ? read(opts['system-file'], '--system-file') : undefined,
@@ -148,9 +152,11 @@ async function main() {
         retry_temperature_step: opts['retry-temperature-step'],
     });
     if (!opts.json) console.log(res.text);
+    if (res.kept) console.error(`kept the closest attempt (${res.kept_source}) in ${res.kept}`);
     console.log(JSON.stringify({ ok: res.ok, attempts: res.attempts, ...(res.steps ? { steps: res.steps } : {}),
         ...(res.verified !== undefined ? { verified: res.verified } : {}), files: res.files, tokens: res.usage,
-        ...(res.fallback ? { fallback: res.fallback } : {}), ...(res.warnings ? { warnings: res.warnings } : {}), ms: Date.now() - started }));
+        ...(res.fallback ? { fallback: res.fallback } : {}), ...(res.warnings ? { warnings: res.warnings } : {}),
+        ...(res.kept ? { kept: res.kept } : {}), ms: Date.now() - started }));
     return !res.ok ? 4 : 0;
 }
 

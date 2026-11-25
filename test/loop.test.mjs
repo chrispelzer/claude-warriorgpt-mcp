@@ -92,6 +92,23 @@ for (const streamed of [true, false]) {
     });
 }
 
+test('loop: a timed-out run_check result reaches the model with the cut-off note', () => {
+    const { one } = setup();
+    writeFileSync(join(dir, 'slow.mjs'), 'setTimeout(() => {}, 5000);\n');
+    const { text } = call({ prompt: 'make it good', files: [one], check: `"${process.execPath}" slow.mjs`, check_timeout_s: 1 }, [
+        block(one, edit('start', 'bad')),
+        tools(['run_check']),
+        tools(['done', { summary: 'gave up' }]),
+    ]);
+    assert.match(text, /did not pass/);
+    // The request after the run_check call carries the tool result the model sees.
+    const tool = requests()[2].messages.at(-1);
+    assert.equal(tool.role, 'tool');
+    assert.match(tool.content, /^TIMED OUT\nThe check was killed after 1 s; its output is cut off, so the runner's summary and failure details are missing\./);
+    assert.match(tool.content, /A hang often means a timer, socket or server left open, or an awaited event that never fires\./);
+    assert.match(tool.content, /If the check is a test runner, run a single failing test file yourself with run_node to see why it fails\./);
+});
+
 test('loop: run_node runs a snippet with this Node in the working directory, with no shell', () => {
     const { one, check } = setup();
     const code = "import { readFileSync } from 'node:fs';\nconsole.log(process.execPath);\nconsole.log(process.cwd());\n" +
@@ -266,6 +283,27 @@ test('runLoop: prose is accepted as done when the check passes', async () => {
     const res = await runLoop(ctx);
     assert.equal(res.passed, true);
     assert.equal(res.steps, 1);
+});
+
+test('runLoop: a timed-out check result carries the cut-off note before the output', async () => {
+    const { ctx, seen } = fakeCtx([{ calls: [['run_check', {}]] }, { calls: [['done', { summary: 's' }]] }],
+        { maxSteps: 3, checkTimeoutS: 1, runCheck: async () => ({ ok: false, code: null, timedOut: true, output: 'partial output' }) });
+    await runLoop(ctx);
+    const tool = seen[1].find((m) => m.role === 'tool');
+    assert.match(tool.content, /^TIMED OUT\nThe check was killed after 1 s; its output is cut off, so the runner's summary and failure details are missing\./);
+    assert.match(tool.content, /A hang often means a timer, socket or server left open, or an awaited event that never fires\./);
+    // The loop has run_node, so the note offers running a single failing test file directly.
+    assert.match(tool.content, /If the check is a test runner, run a single failing test file yourself with run_node to see why it fails\./);
+    assert.ok(tool.content.endsWith('partial output'));
+});
+
+test('runLoop: without run_node the timed-out note drops the run_node sentence', async () => {
+    const { ctx, seen } = fakeCtx([{ calls: [['run_check', {}]] }, { calls: [['done', { summary: 's' }]] }],
+        { maxSteps: 3, checkTimeoutS: 300, runNode: undefined, runCheck: async () => ({ ok: false, code: null, timedOut: true, output: 'x' }) });
+    await runLoop(ctx);
+    const tool = seen[1].find((m) => m.role === 'tool');
+    assert.match(tool.content, /killed after 300 s/);
+    assert.doesNotMatch(tool.content, /run_node/);
 });
 
 test('runLoop: a reply cut off while thinking gets a nudge; broken JSON arguments get an error result', async () => {
@@ -914,4 +952,46 @@ test('loop: run_node in the real tree cannot write anything; only edit changes f
     assert.deepEqual(readdirSync(dir).sort(), [...before, 'home', 'replies.json', 'request.json', 'requests.jsonl'].filter((v, i, a) => a.indexOf(v) === i).sort(),
         'no .venv, no sitecustomize.py');
     assert.equal(readFileSync(one, 'utf8'), 'good\nkeep\n');
+});
+
+test('runLoop: a fix loop stops after three edits to files outside the allowed list, and names them', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, 'a\n');
+    const { ctx, seen } = fakeCtx([
+        { calls: [['edit', { path: 'new_test.go', search: '', replace: 'x' }]] },
+        { calls: [['edit', { path: 'helper.go', search: '', replace: 'x' }]] },
+        { calls: [['edit', { path: 'new_test.go', search: '', replace: 'y' }]] },
+        { calls: [['run_check', {}]] },
+    ], { files: [f], maxSteps: 10 });
+    const res = await runLoop(ctx);
+    assert.equal(res.passed, false);
+    assert.deepEqual(res.blocked, ['new_test.go', 'helper.go']);
+    assert.equal(res.steps, 3, 'it stopped at the third refusal, not at the step cap');
+    assert.equal(seen.length, 3);
+});
+
+test('runLoop: two refused edits do not stop the loop', async () => {
+    const f = join(dir, 'f.txt');
+    writeFileSync(f, 'a\n');
+    const { ctx } = fakeCtx([
+        { calls: [['edit', { path: 'a.txt', search: '', replace: 'x' }], ['edit', { path: 'b.txt', search: '', replace: 'x' }]] },
+        { calls: [['edit', { path: 'f.txt', search: 'a', replace: 'b' }]] },
+        { calls: [['done', { summary: 'ok' }]] },
+    ], { files: [f], maxSteps: 4, runCheck: async () => ({ ok: readFileSync(f, 'utf8').startsWith('b'), code: 0, output: '' }) });
+    const res = await runLoop(ctx);
+    assert.equal(res.passed, true);
+    assert.equal(res.blocked, undefined);
+});
+
+test('loop: three refused edits end the run early and the result says which files to add', () => {
+    const { one, check } = setup();
+    const { text, isError } = call({ prompt: 'x', files: [one], check, max_steps: 10 }, [
+        block(one, edit('start', 'bad')),
+        tools(['edit', { path: 'one_test.txt', search: '', replace: 'x' }], ['edit', { path: 'two.txt', search: '', replace: 'x' }],
+            ['edit', { path: 'one_test.txt', search: '', replace: 'y' }]),
+    ]);
+    assert.equal(isError, true);
+    assert.match(text, /warning: the model tried to change files outside the allowed list: one_test\.txt, two\.txt\. The task needs them: add them to the files list/);
+    assert.match(text, /fallback: opencode/);
+    assert.ok(requests().length <= 3, `${requests().length} requests: it did not run to the step cap`);
 });

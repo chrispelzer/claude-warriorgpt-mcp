@@ -66,6 +66,21 @@ async function survey(root) {
     return { files, links };
 }
 
+// Copies the surveyed files from root into dir. A file deleted after the survey (a lock or marker file, an editor's
+// temp file, a build writing while the check runs) is left out: it is gone from the tree too, so the copy still
+// matches it, and failing the attempt over it would throw away a good reply.
+export async function copyFiles(root, dir, files) {
+    const dirs = new Set(files.map((f) => dirname(join(dir, relative(root, f)))));
+    await Promise.all([...dirs].map((d) => fsp.mkdir(d, { recursive: true })));
+    // A few dozen copies at a time: enough to overlap the I/O without running out of file handles.
+    for (let i = 0; i < files.length; i += 64) {
+        await Promise.all(files.slice(i, i + 64).map((f) =>
+            fsp.copyFile(f, join(dir, relative(root, f)), constants.COPYFILE_FICLONE).catch((err) => {
+                if (err.code !== 'ENOENT' || existsSync(f)) throw err;
+            })));
+    }
+}
+
 export async function makeCopy(root) {
     // The temp folder if it is on the same volume (cheap copies) and not inside the tree itself; else beside the tree.
     const base = sameVolume(tmpdir(), root) && !inside(root, tmpdir()) ? tmpdir() : dirname(root);
@@ -73,13 +88,7 @@ export async function makeCopy(root) {
     const made = [];
     try {
         const { files, links } = await survey(root);
-        const dirs = new Set(files.map((f) => dirname(join(dir, relative(root, f)))));
-        await Promise.all([...dirs].map((d) => fsp.mkdir(d, { recursive: true })));
-        // A few dozen copies at a time: enough to overlap the I/O without running out of file handles.
-        for (let i = 0; i < files.length; i += 64) {
-            await Promise.all(files.slice(i, i + 64).map((f) =>
-                fsp.copyFile(f, join(dir, relative(root, f)), constants.COPYFILE_FICLONE)));
-        }
+        await copyFiles(root, dir, files);
         for (const l of links) {
             const at = join(dir, relative(root, l));
             await fsp.mkdir(dirname(at), { recursive: true });

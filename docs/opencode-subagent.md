@@ -1,5 +1,7 @@
 # Delegating through OpenCode instead
 
+> Since `start_opencode_job` (see the README, "OpenCode jobs"), the MCP server starts this same OpenCode worker itself, with no Haiku subagent in between: install OpenCode (steps 1 and 2 below) and use the tool. This guide still covers the runner, `warriorgpt-delegate`, and the subagent route, for clients without the MCP server or for a subagent that should brief and check the worker on its own. The benchmark below predates the MCP tool; the README has a newer one (2026-11-24) comparing the check loop with this worker.
+
 This MCP server is the simplest way to let Claude Code hand work to WarriorGPT, but it is not the only one. This guide shows the other route: a Claude Code subagent that runs [OpenCode](https://opencode.ai/) against WarriorGPT, so the WarriorGPT model can search the repo, edit files, and run commands itself.
 
 It uses more Claude usage (a Haiku subagent per task) and is slower than `ask_warriorgpt`; see [Compared with ask_warriorgpt](#compared-with-ask_warriorgpt) for the trade-offs and benchmark. The two work side by side: with both set up, Claude can use `ask_warriorgpt` when it can name the files and the subagent for the rest.
@@ -67,60 +69,9 @@ OpenCode reads the key from the `WARRIORGPT_API_KEY` environment variable only; 
 
 Open a new terminal afterwards, and start Claude Code from a terminal so it inherits the variable.
 
-## 3. Add WarriorGPT to OpenCode
+## 3. OpenCode needs no provider setup
 
-Add this provider to OpenCode's global config file, `~/.config/opencode/opencode.json` on macOS and Linux (see OpenCode's [config docs](https://opencode.ai/docs/config/) for the location on Windows). If the file already exists, merge the `providers.warriorgpt` block into it rather than replacing your settings.
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "warriorgpt/local.qwen3.8-27b",
-  "providers": {
-    "warriorgpt": {
-      "name": "WarriorGPT",
-      "env": ["WARRIORGPT_API_KEY"],
-      "package": "@opencode/ai/providers/openai-compatible",
-      "settings": {
-        "baseURL": "https://warriorgpt.wayne.edu/api/v1"
-      },
-      "models": {
-        "local.qwen3.8-27b": {
-          "name": "Qwen 3.8 27B",
-          "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"] },
-          "limit": { "context": 262144, "output": 32768 }
-        },
-        "local.gpt-oss-120b": {
-          "name": "GPT-OSS 120B",
-          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
-          "limit": { "context": 131072, "output": 32768 }
-        },
-        "local.laguna-s-2.1": {
-          "name": "Laguna S 2.1",
-          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
-          "limit": { "context": 131072, "output": 32768 }
-        },
-        "local.gemma-4-31b": {
-          "name": "Gemma 4 31B (vision, no tools)",
-          "capabilities": { "tools": false, "input": ["text", "image"], "output": ["text"] },
-          "limit": { "context": 131072, "output": 32768 }
-        }
-      }
-    }
-  }
-}
-```
-
-Gemma has no tool calling, so OpenCode can use it for chat but not to edit files; the subagent below does not use it.
-
-These are OpenCode 2 key names (`providers`, `package`, `settings`). Older OpenCode versions use `provider`, `npm`, and `options` instead.
-
-Test it from a new terminal:
-
-```
-opencode run -m warriorgpt/local.qwen3.8-27b "Reply with the single word: ok"
-```
-
-A reply of "ok" means the key, config, and gateway all work. A 401 means the key is missing or wrong in this terminal.
+`warriorgpt-delegate` gives OpenCode its own WarriorGPT-only config, so nothing needs adding to your OpenCode config, and an OpenCode Go, Zen or other provider login you have is never used by the worker. It sets `enabled_providers` to WarriorGPT only, refuses any other `--model`, runs OpenCode with its own config, data, state and cache folders under the package state folder (so your OpenCode login is not visible), and removes other providers' API keys from the worker's environment. Your WarriorGPT key reaches it as `WARRIORGPT_API_KEY` (step 2).
 
 ## 4. Check the runner
 
@@ -134,7 +85,7 @@ What it does on each run:
 
 - **Checks the model first.** A model that does not answer (Laguna, for now) exits 3 straight away instead of hanging.
 - **Keeps the worker off your checkout.** In write mode in a git repo it creates a worktree on branch `dl/<name>` from `--base` (default `HEAD`) and the worker commits there. Uncommitted changes in your checkout are not in the worktree. Outside git it works in the folder itself and lists every file added, changed, or deleted.
-- **Gives OpenCode a minimal config.** It takes your `warriorgpt` provider block from `~/.config/opencode/opencode.json` and nothing else: no plugins, MCP servers, skills, `AGENTS.md`, or `CLAUDE.md`. The worker's instructions are the packaged [`delegate/WORKER_RULES.md`](../delegate/WORKER_RULES.md) plus any `--instructions` files. This shrinks every request and keeps your personal setup out of the worker's context.
+- **Builds the config itself.** The worker's OpenCode config holds the WarriorGPT provider only: no plugins, MCP servers, skills, `AGENTS.md` or `CLAUDE.md`, and nothing from your own OpenCode config. The worker's instructions are the packaged [`delegate/WORKER_RULES.md`](../delegate/WORKER_RULES.md) plus any `--instructions` files.
 - **Uses two OpenCode agents.** `delegate-worker` writes; `delegate-reader` (`--mode read`) answers questions and cannot edit files or run destructive commands. Both have OpenCode's question tool turned off, because an unattended run would hang on it. These permissions limit OpenCode's tools; they are not a sandbox, and a shell command can still reach outside the folder.
 - **Lets the worker ask questions.** A worker that hits a question that changes the result stops with `STATUS: NEEDS_INPUT` and numbered questions, each with a default. Rerun with `--continue --resume` and a brief holding the answers, and it continues the same OpenCode session, keeping everything it already read.
 - **Writes a run folder** under `~/.local/share/warriorgpt-mcp/runs/<project>/<name>` (`%LOCALAPPDATA%\warriorgpt-mcp\runs\...` on Windows) with the brief, the OpenCode event log, `report.md`, and `summary.json`, and logs tokens to the same `usage.jsonl` as `ask_warriorgpt`.
@@ -238,7 +189,7 @@ Return a task that is too big for the model, unrun, with the split you suggest.
 
 Add a rule like this to your `CLAUDE.md` (global `~/.claude/CLAUDE.md`, or a project's):
 
-> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` when you can name every file to create or change. Use the `warrior-coder` subagent when the model needs to find files itself or run the code to check it. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. Split mixed tasks so the mechanical part still goes to WarriorGPT. If WarriorGPT gets the same task wrong twice, do it yourself.
+> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` when you can name every file to create or change. Use `start_opencode_job` (or, without the MCP server, the `warrior-coder` subagent) when the model needs to find files itself or run the code to check it. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. Split mixed tasks so the mechanical part still goes to WarriorGPT. If WarriorGPT gets the same task wrong twice, do it yourself.
 
 ## Try it
 
@@ -253,6 +204,5 @@ In a git repository, start Claude Code and give it a small, concrete task, for e
 | `warriorgpt-delegate` exits 1 with an `opencode` error | Check `opencode --version` is 2 or newer, and look at the `stderr` log in the run folder. |
 | "branch dl/<name> already exists" | An earlier run used that name. Merge or delete it (step 4), or pick another `--name`. |
 | 429 / `quota_exceeded` | WarriorGPT rate limit or quota. Wait and retry, or let Claude do the task itself. |
-| Laguna errors | Laguna S 2.1 is not reachable on the gateway yet (it returns 500). The runner exits 3 for it. |
 | `warrior-coder` not found | The file is not in `~/.claude/agents/`, or Claude Code was not restarted after creating it. |
-| OpenCode rejects the config | Your OpenCode version uses the older key names; see the note under step 3. |
+| OpenCode rejects the config | The worker config uses OpenCode's `provider`, `npm` and `options` key names, tested on OpenCode 2.3.2. Check `opencode --version` and the `stderr` log in the run folder. |
