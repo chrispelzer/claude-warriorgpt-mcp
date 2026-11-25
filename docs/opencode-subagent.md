@@ -1,5 +1,7 @@
 # Delegating through OpenCode instead
 
+> Since `start_opencode_job` (see the README, "OpenCode jobs"), the MCP server starts this same OpenCode worker itself, with no Haiku subagent in between: install OpenCode (steps 1 and 2 below) and use the tool. This guide still covers the runner, `warriorgpt-delegate`, and the subagent route, for clients without the MCP server or for a subagent that should brief and check the worker on its own. The benchmark below predates the MCP tool; the README has a newer one (2026-11-24) comparing the check loop with this worker.
+
 This MCP server is the simplest way to let Claude Code hand work to WarriorGPT, but it is not the only one. This guide shows the other route: a Claude Code subagent that runs [OpenCode](https://opencode.ai/) against WarriorGPT, so the WarriorGPT model can search the repo, edit files, and run commands itself.
 
 It uses more Claude usage (a Haiku subagent per task) and is slower than `ask_warriorgpt`; see [Compared with ask_warriorgpt](#compared-with-ask_warriorgpt) for the trade-offs and benchmark. The two work side by side: with both set up, Claude can use `ask_warriorgpt` when it can name the files and the subagent for the rest.
@@ -187,7 +189,7 @@ Return a task that is too big for the model, unrun, with the split you suggest.
 
 Add a rule like this to your `CLAUDE.md` (global `~/.claude/CLAUDE.md`, or a project's):
 
-> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` when you can name every file to create or change. Use the `warrior-coder` subagent when the model needs to find files itself or run the code to check it. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. Split mixed tasks so the mechanical part still goes to WarriorGPT. If WarriorGPT gets the same task wrong twice, do it yourself.
+> WarriorGPT is available for small, fully specified coding tasks where a wrong result is easy to spot from the diff. Use `ask_warriorgpt` when you can name every file to create or change. Use `start_opencode_job` (or, without the MCP server, the `warrior-coder` subagent) when the model needs to find files itself or run the code to check it. Keep design, debugging, review, and subtle logic (security, concurrency, data migrations) with Claude. Split mixed tasks so the mechanical part still goes to WarriorGPT. If WarriorGPT gets the same task wrong twice, do it yourself.
 
 ## Try it
 
