@@ -47,7 +47,7 @@ export function track(progress, line, now = Date.now()) {
 }
 
 // run(args, { signal, onLog }) does the work and resolves with its result, or throws.
-export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now = Date.now } = {}) {
+export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now = Date.now, prefix = 'wgpt' } = {}) {
     const jobs = new Map();
     const waiting = [];
     const live = new Set();
@@ -108,7 +108,7 @@ export function createJobs({ run, maxRunning = envMax(), keepMs = KEEP_MS, now =
         if (running >= maxRunning && waiting.length >= MAX_QUEUED) {
             throw new Error(`${running} jobs running and ${waiting.length} waiting; wait for some to finish or cancel them.`);
         }
-        const id = `wgpt-${randomBytes(4).toString('hex')}`;
+        const id = `${prefix}-${randomBytes(4).toString('hex')}`;
         const job = { id, args, files: filesOf(args), blockedBy: null, state: 'queued', created: now(), started: null, finished: null,
             ctl: new AbortController(), log: [], waiters: [], progress: { replies: 0, step: null, retries: 0, phase: null, next_retry: null } };
         jobs.set(id, job);
