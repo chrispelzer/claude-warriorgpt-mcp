@@ -10,6 +10,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { runOpenCode, snapshotBase, fallbackBrief, taskName } from '../opencode-jobs.mjs';
 import { CancelledError, UsageError } from '../ask.mjs';
 
+// A check sandbox may set GIT_DIR (Ask-Checked does, for read-only git); these tests make scratch repos, so they drop it.
+for (const v of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) delete process.env[v];
+
 const here = fileURLToPath(new URL('.', import.meta.url));
 const MOCK = pathToFileURL(join(here, 'mock-fetch.mjs')).href;
 const FAKE = join(here, 'fake-opencode.mjs');

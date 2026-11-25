@@ -11,11 +11,9 @@ import { UsageError, CancelledError } from './ask.mjs';
 
 const DELEGATE = fileURLToPath(new URL('./warriorgpt-delegate.mjs', import.meta.url));
 
-// This module shells out to git in arbitrary directories. GIT_DIR and its friends would steer every one of
-// those calls to the wrong repository, so they are dropped from the inherited environment at load time.
+// The git calls here and the delegate's own run in other repositories: an inherited GIT_DIR and its friends would
+// steer them to the wrong one, so the child processes never get them (unless set on purpose in extra).
 const GIT_ENV_VARS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR'];
-for (const v of GIT_ENV_VARS) delete process.env[v];
-
 function gitEnv(extra = {}) {
     const env = { ...process.env, ...extra };
     for (const v of GIT_ENV_VARS) if (!(v in extra)) delete env[v];
@@ -139,7 +137,7 @@ export async function runOpenCode(args, { signal, onLog } = {}, { nodeArgs = pro
             ...(reply ? ['--continue', '--resume'] : []),
         ];
         const child = spawn(process.execPath, childArgs,
-            { cwd: dir, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+            { cwd: dir, env: gitEnv(env), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
 
         let cancelled = false;
         const onAbort = () => {
@@ -152,9 +150,12 @@ export async function runOpenCode(args, { signal, onLog } = {}, { nodeArgs = pro
         if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
         let stdout = '', stderr = '', rest = '';
+        // Decode as a stream, so a character split across two chunks stays whole.
+        child.stdout.setEncoding('utf8');
+        child.stderr.setEncoding('utf8');
         child.stdout.on('data', (chunk) => {
-            stdout += chunk.toString('utf8');
-            rest += chunk.toString('utf8');
+            stdout += chunk;
+            rest += chunk;
             let i;
             while ((i = rest.indexOf('\n')) >= 0) {
                 const line = rest.slice(0, i);
@@ -162,11 +163,13 @@ export async function runOpenCode(args, { signal, onLog } = {}, { nodeArgs = pro
                 onLog?.(line);
             }
         });
-        child.stderr.on('data', (chunk) => { stderr += chunk.toString('utf8'); });
+        child.stderr.on('data', (chunk) => { stderr += chunk; });
 
+        // close, not exit: close waits for stdout to drain, and the report comes last.
         const exit = await new Promise((resolveExit, rejectExit) => {
             child.on('error', rejectExit);
-            child.on('exit', (code) => {
+            child.on('close', (code) => {
+                if (rest) onLog?.(rest);
                 if (cancelled) rejectExit(new CancelledError('cancelled'));
                 else resolveExit(code ?? 1);
             });

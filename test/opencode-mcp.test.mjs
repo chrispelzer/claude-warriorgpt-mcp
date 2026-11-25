@@ -9,6 +9,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+// A check sandbox may set GIT_DIR (Ask-Checked does, for read-only git); these tests make scratch repos, so they drop it.
+for (const v of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR']) delete process.env[v];
+
 const here = fileURLToPath(new URL('.', import.meta.url));
 const SERVER = resolve(here, '../warriorgpt-mcp.mjs');
 const MOCK = pathToFileURL(join(here, 'mock-fetch.mjs')).href;
