@@ -228,7 +228,7 @@ test('a reset connection (502 upstream_unreachable) is retried twice, then fails
     assert.equal(r.isError, true);
     assert.equal(times().length, 3, 'two retries, not five');
     assert.match(r.text, /^WarriorGPT 502 \(upstream_unreachable\): The connection to the model server failed or was reset before it answered\. Retry the request\. Correlation ID: abc123/);
-    assert.match(r.text, /gave up after 3 tries in \d+ s\); the same request was reset every time; if the prompt or files contain text a network filter may block \(e\.g\. shell_exec\( \), that is the likely cause$/);
+    assert.match(r.text, /gave up after 3 tries in \d+ s\); the same request was reset every time; if the prompt or files contain text a network filter may block \(e\.g\. a PHP shell_exec call\), that is the likely cause$/);
     // Other 502s and 503s keep the normal cap.
     dir = mkdtempSync(join(tmpdir(), 'warriorgpt-retry-test-'));
     const busy = call({ prompt: 'hi' }, { env: { MOCK_FAIL_FIRST: JSON.stringify([...Array(2).fill({ status: 502, code: 'bad_gateway' }),

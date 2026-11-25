@@ -16,7 +16,7 @@ export const KIND_CAPS = { timeout: 2, server: 1, reset: 2 };
 // Added to the final error when a kind's retries run out.
 export const GIVE_UP_HINTS = {
     reset: 'the same request was reset every time; if the prompt or files contain text a network filter may block ' +
-        '(e.g. shell_exec( ), that is the likely cause',
+        '(e.g. a PHP shell_exec call), that is the likely cause',
 };
 // The response waits on the gateway's own slot queue (up to 30 s) before headers, so this must be well above it.
 export const DEFAULT_HEADER_TIMEOUT_MS = 180_000;
