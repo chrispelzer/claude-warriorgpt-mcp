@@ -3,7 +3,21 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, lstatSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeCopy, inside, CantCopyError, TooBigError } from '../workspace.mjs';
+import { makeCopy, copyFiles, inside, CantCopyError, TooBigError } from '../workspace.mjs';
+
+test('a file deleted between the survey and the copy is left out, not an error', async () => {
+    const root = tree();
+    const dir = mkdtempSync(join(tmpdir(), 'warriorgpt-ws-dest-'));
+    try {
+        // gone.txt was listed by the survey, then deleted before the copy (as the server's active-<session> marker is).
+        await copyFiles(root, dir, [join(root, 'src', 'a.js'), join(root, 'src', 'gone.txt')]);
+        assert.equal(readFileSync(join(dir, 'src', 'a.js'), 'utf8'), 'export const a = 1;\n');
+        assert.equal(existsSync(join(dir, 'src', 'gone.txt')), false);
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
 
 function tree() {
     const root = mkdtempSync(join(tmpdir(), 'warriorgpt-ws-test-'));

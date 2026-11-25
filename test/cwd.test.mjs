@@ -78,7 +78,8 @@ test('programFound: a Windows app execution alias (lstat only) counts as present
         try {
             // A dangling symlink stands in for an app execution alias: existsSync follows it and fails, lstat sees it.
             symlinkSync(join(dir, 'missing-target'), join(dir, 'fakepwsh.exe'));
-            assert.equal(programFound('fakepwsh', dir, { PATH: dir, PATHEXT: '.EXE' }, 'win32'), true,
+            // PATHEXT in the file's own case: on Linux and macOS CI the file system is case-sensitive.
+            assert.equal(programFound('fakepwsh', dir, { PATH: dir, PATHEXT: '.exe' }, 'win32'), true,
                 'a dangling .exe symlink is present');
         } catch (err) {
             if (err.code !== 'EPERM' && err.code !== 'ENOTSUP') throw err;
